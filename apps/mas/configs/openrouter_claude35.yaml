@@ -1,0 +1,13 @@
+model: anthropic/claude-3.5-sonnet
+temperature: 0.0
+top_p: 0.9
+presence_penalty: 0.0
+frequency_penalty: 0.0
+max_output_tokens: 256
+request_timeout_s: 60
+max_retries: 3
+rate_limit_rps: 2
+headers:
+  http_referer: https://example.org/mas
+  x_title: MAS-Orchestrator
+

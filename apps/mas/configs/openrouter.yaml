@@ -1,0 +1,18 @@
+model: openai/gpt-5.1
+temperature: 0.0
+top_p: 0.9
+presence_penalty: 0.0
+frequency_penalty: 0.0
+max_output_tokens: 1024
+request_timeout_s: 120
+max_retries: 3
+rate_limit_rps: 2
+headers:
+  http_referer: https://example.org/mas
+  x_title: MAS-Orchestrator
+
+worker_model: openai/o3-mini
+supervisor_fallback_model: x-ai/grok-4
+worker_fallback_model: x-ai/grok-4.1-fast
+supervisor_secondary_fallback_model: openai/gpt-4o
+worker_secondary_fallback_model: openai/gpt-4o

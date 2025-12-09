@@ -1,0 +1,12 @@
+source "/home/qlu/Documents/Multi-Agent Reasoning System/.venv/bin/activate"
+python - <<'PY'
+from apps.mas.graph.plan_graph import build_graph, GraphState
+app = build_graph('apps/mas/configs/openrouter.yaml').compile()
+res = app.invoke(GraphState(problem='Sarah buys 4 boxes of pencils with 6 pencils in each. She loses 5 pencils on the way home and gives 7 pencils to a friend. Later, she buys 3 more boxes with 2 pencils in each. How many pencils does Sarah have now?'))
+val = (res.get('final_answer','') if isinstance(res, dict) else getattr(res, 'final_answer', ''))
+print(val)
+PY
+
+
+
+cd "/home/qlu/Documents/Multi-Agent Reasoning System" && source .venv/bin/activate && python -m apps.mas.web.chat_ui --config apps/mas/configs/openrouter.yaml --server-name 127.0.0.1 --server-port 7860
