@@ -8,8 +8,10 @@ from ..infra.openrouter.client import OpenRouterClient, OpenRouterConfig
 
 
 class SubTask(BaseModel):
-    role: Literal["math", "qa", "logic"]
+    id: Optional[str] = None
+    role: Literal["math", "qa", "logic", "research"]
     instruction: str
+    depends_on: List[str] = []
 
 
 class Plan(BaseModel):
@@ -18,14 +20,16 @@ class Plan(BaseModel):
 
 SYSTEM_SUPERVISOR = (
     "You are the Supervisor. Decompose the user problem into strict, minimal subtasks.\n"
-    "Available roles: {math, qa, logic}\n"
+    "Available roles: {math, qa, logic, research}\n"
     "- math: arithmetic, algebra, numerical computation, mathematical proofs\n"
     "- qa: factual knowledge, humanities, history, literature, science facts, definitions\n"
-    "- logic: reasoning puzzles, deduction, multi-step logical analysis, boolean logic\n\n"
+    "- logic: reasoning puzzles, deduction, multi-step logical analysis, boolean logic\n"
+    "- research: complex math/logic tasks that benefit from simulation, enumeration, or code-backed sanity checks\n\n"
     "Guidelines:\n"
     "- For simple arithmetic (e.g., 'What is 12*13?'), use a single math subtask.\n"
     "- For factual questions (e.g., 'Who wrote Hamlet?'), use a single qa subtask.\n"
     "- For complex problems, break into multiple subtasks with appropriate roles.\n"
+    "- Use a research subtask when the task involves simulations, enumerations, subgroup counts, eigenvalue-set enumeration, toggling processes, or knot/quandle counting.\n"
     "- ALWAYS provide a non-empty instruction for each subtask.\n"
     "Return ONLY a JSON list with entries having fields: role, instruction."
 )
@@ -53,6 +57,16 @@ def _parse_plan(text: str) -> Plan:
     except Exception:
         # Fallback: naive heuristic (single generic subtask)
         return Plan(subtasks=[SubTask(role="logic", instruction=text.strip())])
+
+
+def _needs_research(problem: str) -> bool:
+    p = problem.lower()
+    research_keys = [
+        "eigenvalue", "root of unity", "unit circle", "subgroup", "index",
+        "free product", "hotel", "guest", "light", "toggle", "knot", "quandle",
+        "rank-1", "rank 1", "matrix", "matrices", "representation"
+    ]
+    return any(k in p for k in research_keys)
 
 
 class SupervisorAgent:
@@ -96,7 +110,6 @@ class SupervisorAgent:
             
         plan = _parse_plan(text)
         
-        # Guardrail: if decomposition failed (empty instruction), create a minimal fallback plan
         def _is_numeric(q: str) -> bool:
             p = q.strip().lower()
             return any(k in p for k in ("how many", "what is", "compute", "evaluate", "result", "value of"))
@@ -105,6 +118,17 @@ class SupervisorAgent:
             p = q.strip().lower()
             return any(k in p for k in ("who ", "when ", "where ", "what year", "which ", "name the", "define ", "explain "))
         
+        # If the question is numeric but no math subtask was produced, insert one to force numeric reasoning.
+        if _is_numeric(problem) and not any(st.role == "math" for st in plan.subtasks):
+            self._emit_thinking("decompose_math_injection", "Numeric query detected; adding math subtask for precise counting.")
+            plan.subtasks = [SubTask(role="math", instruction=problem.strip())] + list(plan.subtasks)
+
+        # Inject research subtask for complex math/logic that benefit from simulation
+        if _needs_research(problem) and not any(st.role == "research" for st in plan.subtasks):
+            self._emit_thinking("decompose_research_injection", "Complex pattern detected; adding research subtask for simulation/code.")
+            plan.subtasks = [SubTask(role="research", instruction=problem.strip())] + list(plan.subtasks)
+        
+        # Guardrail: if decomposition failed (empty instruction), create a minimal fallback plan
         if (not plan.subtasks) or all(not (st.instruction or "").strip() for st in plan.subtasks):
             if _is_numeric(problem):
                 role = "math"
