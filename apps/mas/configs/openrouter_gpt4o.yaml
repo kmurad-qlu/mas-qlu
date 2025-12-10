@@ -1,4 +1,4 @@
-model: openai/gpt-4o
+model: mistralai/mistral-large-2512
 temperature: 0.0
 top_p: 0.9
 presence_penalty: 0.0
@@ -10,4 +10,16 @@ rate_limit_rps: 2
 headers:
   http_referer: https://example.org/mas
   x_title: MAS-Orchestrator
+
+# Mistral-only routing
+worker_model: mistralai/mistral-small-3.2-24b-instruct
+supervisor_fallback_model: mistralai/mistral-medium-3.1
+worker_fallback_model: mistralai/mistral-medium-3.1
+supervisor_secondary_fallback_model: null
+worker_secondary_fallback_model: null
+
+swarm_models:
+  - mistralai/mistral-large-2512
+  - mistralai/mistral-medium-3.1
+  - mistralai/mistral-small-3.2-24b-instruct
 

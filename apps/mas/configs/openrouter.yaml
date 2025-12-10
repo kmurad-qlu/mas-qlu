@@ -1,4 +1,4 @@
-model: openai/gpt-5.1
+model: mistralai/mistral-large-2512
 temperature: 0.0
 top_p: 0.9
 presence_penalty: 0.0
@@ -11,8 +11,23 @@ headers:
   http_referer: https://example.org/mas
   x_title: MAS-Orchestrator
 
-worker_model: openai/o3-mini
-supervisor_fallback_model: x-ai/grok-4
-worker_fallback_model: x-ai/grok-4.1-fast
-supervisor_secondary_fallback_model: openai/gpt-4o
-worker_secondary_fallback_model: openai/gpt-4o
+worker_model: mistralai/mistral-small-3.2-24b-instruct
+supervisor_fallback_model: mistralai/mistral-medium-3.1
+worker_fallback_model: mistralai/mistral-medium-3.1
+supervisor_secondary_fallback_model: null
+worker_secondary_fallback_model: null
+
+# Swarm worker configuration
+swarm_models:
+  - mistralai/mistral-large-2512
+  - mistralai/mistral-medium-3.1
+  - mistralai/mistral-small-3.2-24b-instruct
+swarm_min_responses: 2
+swarm_per_model_timeout: 120
+swarm_overall_timeout: 300
+
+# Cooperative swarm configuration
+coop_enabled: true
+coop_max_rounds: 2
+coop_min_agreement: 2
+coop_reconcile_prompt: "Peers disagree; reconcile and provide the single best answer."

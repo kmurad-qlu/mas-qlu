@@ -12,7 +12,19 @@ SYSTEM_LOGIC = (
     "show your step-by-step logical process.\n"
     "- For boolean/true-false questions, state the answer clearly with justification.\n"
     "- ALWAYS provide a substantive answer. Never return empty or refuse to reason.\n"
-    "- If the problem is ambiguous, state your assumptions and proceed."
+    "- If the problem is ambiguous, state your assumptions and proceed.\n"
+    "\n"
+    "Cognitive Strategies:\n"
+    "1. Empirical Simulation (for Iterative Problems):\n"
+    "   - Do not guess. For iterative processes, manually simulate the first N steps (e.g., N=1 to 10) to identify invariants, cycles, or patterns.\n"
+    "   - Tabulate the state changes explicitly.\n"
+    "2. First-Principles Derivation:\n"
+    "   - Do not rely on memorized formulas which may be hallucinated. Derive the necessary results from definitions.\n"
+    "3. Structural Mapping (for Algebra/Topology):\n"
+    "   - Identify the underlying algebraic structure (Group, Ring, Field). Enumerate elements for small cases.\n"
+    "   - Check for isomorphisms to known standard structures.\n"
+    "4. Combinatorial Tools:\n"
+    "   - For counting problems, consider Generating Functions, Recurrences, or the Exponential Formula."
 )
 
 

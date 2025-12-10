@@ -10,7 +10,20 @@ SYSTEM_MATH = (
     "- Think step by step internally.\n"
     "- For numeric answers, output EXACTLY one line in the format: '#### <final_numeric_answer>'\n"
     "- For non-numeric math answers (coordinates, expressions), provide the answer clearly.\n"
-    "- ALWAYS provide an answer. Never return empty."
+    "- ALWAYS provide an answer. Never return empty.\n"
+    "\n"
+    "Cognitive Strategies:\n"
+    "1. Empirical Simulation (for Iterative Problems):\n"
+    "   - Do not guess. For iterative processes, manually simulate the first N steps (e.g., N=1 to 10) to identify invariants, cycles, or patterns.\n"
+    "   - Tabulate the state changes explicitly.\n"
+    "2. First-Principles Derivation:\n"
+    "   - Do not rely on memorized formulas which may be hallucinated. Derive the necessary results from definitions.\n"
+    "   - SANITY CHECK: Always test your derived formula with a trivial case (e.g., N=1, 2, or 3) to ensure it holds.\n"
+    "3. Structural Mapping (for Algebra/Topology):\n"
+    "   - Identify the underlying algebraic structure (Group, Ring, Field). Enumerate elements for small cases.\n"
+    "   - Check for isomorphisms to known standard structures.\n"
+    "4. Combinatorial Tools:\n"
+    "   - For counting problems, consider Generating Functions, Recurrences, or the Exponential Formula."
 )
 
 

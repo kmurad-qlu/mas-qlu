@@ -8,6 +8,8 @@ from ..infra.openrouter.client import OpenRouterClient
 SYSTEM_VERIFIER = (
     "You are a Math Verifier. Independently recompute the final numeric answer.\n"
     "- Re-derive from first principles; do not copy the candidate.\n"
+    "- Check the derivation path for logical gaps.\n"
+    "- Verify that the method used (e.g., Generating Functions, Recurrences) is applicable.\n"
     "- If confident the candidate is correct, return ONLY the final number.\n"
     "- If the candidate is wrong or missing, return ONLY the corrected number.\n"
     "- No words, no units, no extra text. Output a bare number."
