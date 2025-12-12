@@ -1,0 +1,52 @@
+{
+  "template_id": "spectral_cayley_v1",
+  "domain_tags": ["cayley", "eigenvalue", "spectrum", "abelian", "roots of unity", "representation"],
+  "description": "Enumerate distinct spectra for Cayley graphs of finite abelian groups (e.g., Z_18).",
+  "knowledge_seeds": [
+    "For an abelian group G, eigenvalues of Cayley graph Cay(G,S) are lambda_chi = sum_{s in S} chi(s) for each irreducible character chi.",
+    "For cyclic Z_n, characters are chi_k(x) = exp(2*pi*i*k*x/n).",
+    "Undirected Cayley graphs require S = S^{-1}, which yields real eigenvalues (complex conjugate pairs sum to reals)."
+  ],
+  "graph_blueprint": {
+    "entrypoint": "n1_define_group",
+    "nodes": [
+      {
+        "id": "n1_define_group",
+        "type": "definition",
+        "role": "logic",
+        "instruction": "Define G = Z_18 as an additive cyclic group. List irreducible characters chi_k(x) = exp(2*pi*i*k*x/18) for k in 0..17 and describe the character table compactly."
+      },
+      {
+        "id": "n2_enumerate_sets",
+        "type": "enumeration",
+        "role": "logic",
+        "instruction": "Enumerate inverse-closed connection sets S ⊆ Z_18 \\ {0}. Group by symmetry (S = S^{-1}). Provide a concise list of candidate S sets."
+      },
+      {
+        "id": "n3_compute_spectra",
+        "type": "calculation",
+        "role": "research",
+        "instruction": "For each candidate S, compute spectra using lambda_chi = sum_{s in S} chi(s). Use Python to enumerate, normalize each multiset (sorted), and collect unique spectra. End with the count in format '#### <number>'."
+      },
+      {
+        "id": "n4_verify_real",
+        "type": "verification",
+        "role": "logic",
+        "instruction": "Check spectra for reality/integer properties expected from S = S^{-1}. If any non-real entries appear, adjust enumeration. Provide a brief validation note."
+      },
+      {
+        "id": "n5_aggregate",
+        "type": "aggregation",
+        "role": "logic",
+        "instruction": "Aggregate validated spectra and output the number of distinct spectra as '#### <number>'. Summarize any representative spectra if needed."
+      }
+    ],
+    "edges": [
+      { "source": "n1_define_group", "target": "n3_compute_spectra" },
+      { "source": "n2_enumerate_sets", "target": "n3_compute_spectra" },
+      { "source": "n3_compute_spectra", "target": "n4_verify_real" },
+      { "source": "n4_verify_real", "target": "n5_aggregate" }
+    ]
+  }
+}
+

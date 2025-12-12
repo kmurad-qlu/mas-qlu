@@ -1,148 +1,59 @@
-# MAS-qlu
+# Multi-Agent Reasoning System (MAS)
 
-Scalable, hierarchical multi-agent reasoning system with strict output policies, per-role model control, and an optional latent communication pipeline.
+High-level overview of the end-to-end methodology, architecture, and concepts used to tackle hard reasoning tasks such as Humanity’s Last Exam (HLE). This is a conceptual guide—refer to in-code docstrings for API-level details.
 
-- Orchestrator: LangGraph state machine (supervisor → math → QA → logic → critic → synthesize)
-- Agents: Supervisor (decompose/synthesize/critique), Workers (math/qa/logic), Verifier (numeric check)
-- LLM IO: OpenAI-compatible client via OpenRouter (per-role model overrides supported)
-- UI: Gradio chat
-- Benchmarks: GSM8K, HotpotQA, BBH boolean
-- Latent pipeline: HF local model flow with hidden→embedding projection and KV-transfer
+## Goals
+- Solve complex, multi-step reasoning problems with verifiable outputs.
+- Combine structured decomposition, multi-model consensus, code-backed experiments, and verification.
+- Leverage templated graph reasoning (TGR) to reduce hallucinations and cold-start failures on math-heavy tasks.
 
-## Contents
+## Architecture at a Glance
+- **Supervisor**: Decomposes a user problem into subtasks (roles: math, logic, QA, research), synthesizes results, and enforces output policies.
+- **Swarm Workers**: Parallel model ensemble with cooperative reconciliation to reach consensus quickly.
+- **Research Worker**: Runs code-backed experiments (Python sandbox) using problem-specific scaffolds.
+- **Verifier**: Independently recomputes numeric answers; returns a bare number.
+- **Templated Graph Reasoning (TGR)**: Injects Buffer-of-Thought templates into a Graph-of-Thought controller for structured, template-guided DAG execution.
+- **Config & Infra**: OpenRouter-backed LLM access; YAML configs set models, timeouts, swarm/TGR toggles.
 
-- apps/mas/graph/plan_graph.py: Orchestrator graph and state
-- apps/mas/agents/: Supervisor, workers, verifier
-- apps/mas/infra/: OpenRouter client, env helpers, HF runner
-- apps/mas/web/chat_ui.py: Gradio interface
-- apps/mas/benchmarks/: GSM8K, HotpotQA, BBH runners
-- apps/mas/latent/: Latent comms (alignment, projection, KV transfer)
-- apps/mas/configs/: OpenRouter YAMLs (model choices, per-role overrides)
+## Execution Flow
+1. **Decomposition**: Supervisor builds a plan of subtasks with roles and optional dependencies. Numeric and complex patterns auto-inject math/research tasks.
+2. **Dispatch**: Swarm Workers run role-specific prompts in parallel; Research Worker executes code for simulation/enumeration cases.
+3. **Critique**: Supervisor checks consistency of worker outputs.
+4. **Synthesis**: Supervisor aggregates results; numeric answers are tightened to a single value or compact JSON when needed.
+5. **Verification**: Verifier recomputes numeric answers independently; replaces the candidate if it disagrees.
+6. **TGR Fast-Path (when enabled)**: A template is selected via the distiller, hydrated into a DAG, and executed via the GoT controller, using swarm/research nodes plus verifier checkpoints.
 
-## Methodology
+## Agents & Roles
+- **Supervisor**: Plans, critiques, and synthesizes.
+- **Swarm Workers**: Math, Logic, QA prompts with cooperative consensus and early return once a quorum is reached.
+- **Research Worker**: Iterative “Ouroboros” loop—generate code, execute, observe, refine (timeout-aware).
+- **Verifier**: Low-temperature, independent numeric check.
 
-- Hierarchical decomposition: Supervisor converts a user problem into a JSON Plan of SubTasks (roles: math, qa, logic).
-- Specialized workers: Each role uses a tailored system prompt and decoding settings.
-- Critique loop: A critic pass evaluates consistency; a repair synthesis may run if issues are found.
-- Strict output policy:
-  - Single-number questions → return exactly the number (no prose).
-  - Multi-quantity questions → compact JSON (snake_case keys, numeric values).
-  - Yes/No → “yes” or “no”; boolean expressions → “T” or “F”.
-- Numeric extraction and guarding:
-  - Prefer ‘#### <number>’ from MathWorker; otherwise safely extract a single unique number; avoid guessing when multiple numbers exist.
-- Latent communication (optional):
-  - Learn a linear map W to project last hidden states to input embeddings; continue generation using KV cache and projected “latent seed” embeddings (HF local models).
+## Templated Graph Reasoning (TGR)
+- **Templates (Buffer-of-Thought)**: JSON blueprints capturing node types (definition, enumeration, calculation, aggregation, verification), edges, prompts, and knowledge seeds.
+- **Graph Controller (Graph-of-Thought)**: Hydrates templates into runnable DAGs; each node runs via swarm or research; verification nodes can invoke the verifier. Context is scoped per node to prevent drift; consensus helpers pick best answers.
+- **Template Distiller**: Heuristic keyword matcher that selects the best template for the problem (e.g., spectral Cayley spectra, rank-1 matrices/equiangular lines, figure-8 quandle coloring).
+- **Archetype Coverage**: Hotel toggle (cat reset) → 48 blues; Abelian spectra (|G|=18) → 8 sets; Rank-1 admissibility → only k=ab-1 inadmissible; Free product C2*C5 index-7 subgroups → 56; Figure-8 quandle → size 4; Artin(E8)/Z order-10 torsion minimal positive words → 624 (CHEVIE rationale).
 
-## Architecture
+## Data & Configuration
+- **Configs**: `apps/mas/configs/openrouter.yaml` sets models, swarm parameters, and TGR toggles (`tgr_enabled`, template path, node/overall timeouts).
+- **Templates**: Stored under `apps/mas/configs/templates/*.json`.
+- **Sandbox Execution**: Python executor with timeouts for Research Worker code.
 
-### Orchestrator (LangGraph)
-- State: `GraphState(problem, plan, results, critique_note, final_answer[, thinking_log])`
-- Nodes/flow:
-  1) supervisor.decompose → Plan(JSON)
-  2) dispatch math/qa/logic → collect `(SubTask, result)`
-  3) supervisor.critique → short note or “OK”
-  4) supervisor.synthesize → final answer
-  5) Enforcers:
-     - If single-number question, coerce to bare number (only if unambiguous)
-     - If multi-answer, accept JSON and render as lines
-  6) Optional: verifier.verify_numeric to correct numeric outputs
+## Running
+1. Set `OPENROUTER_API_KEY` (or compatible) in environment.
+2. Run benchmarks: `python scripts/test_humanity_exam.py` (respects config timeouts and TGR toggle).
+3. Adjust models/timeouts in `openrouter.yaml` as needed.
 
-### Agents
-- Supervisor: `decompose`, `synthesize`, `critique`, `resynthesize_with_critique`; supports per-call model overrides and fallbacks.
-- Workers:
-  - MathWorker: emits “#### <number>”
-  - QAWorker: concise factual answers
-  - LogicWorker: terse logical conclusions
-- Verifier: second-opinion numeric checker.
+## Concepts Employed
+- **Swarm Consensus**: Parallel LLM calls with reconciliation and early return on quorum.
+- **Code-Backed Reasoning**: Prefer executable simulations/enumerations over theory-only answers for brittle domains.
+- **Verification**: Independent numeric recomputation to catch drift.
+- **Template-Guided Graphs**: Buffer-of-Thought templates seed Graph-of-Thought execution to avoid cold starts and enforce domain structure.
+- **Timeout & Budgeting**: Per-node and overall budgets to remain responsive under complex tasks.
 
-### Infra
-- OpenRouterClient: OpenAI chat-completions with retries, timeouts, usage tracking.
-- Env helpers: `OPENROUTER_API_KEY` (or `OPENAI_API_KEY`), `OPENAI_BASE_URL`, referer/title headers.
-- HF runner: tokenize, hidden states, KV caching, sampled/greedy continuation.
+## Extensibility
+- Add new templates for emerging domains by defining node prompts, edges, and seeds.
+- Extend the distiller with richer semantic matching or embedding-based retrieval.
+- Plug in stronger models in `openrouter.yaml` (e.g., reasoning-optimized variants) without changing code.
 
-## Models and configuration
-
-Central config (choose one):
-- `apps/mas/configs/openrouter.yaml` (default)
-- `apps/mas/configs/openrouter_grok.yaml`
-- `apps/mas/configs/openrouter_gpt4o.yaml`
-- `apps/mas/configs/openrouter_claude35.yaml`
-
-Typical keys:
-model: openai/gpt-5.1
-temperature: 0.0
-top_p: 0.9
-max_output_tokens: 1024
-request_timeout_s: 120
-# Optional per-role overrides and fallbacks
-worker_model: openai/o3-mini
-supervisor_fallback_model: x-ai/grok-4
-worker_fallback_model: x-ai/grok-4.1-fast
-supervisor_secondary_fallback_model: openai/gpt-4o
-worker_secondary_fallback_model: openai/gpt-4oNotes:
-- All agents share the same OpenRouter client; each call can override `model` at runtime.
-- If no model is provided in YAML, a safe default (e.g., Mixtral) is used.
-
-## Getting started
-
-### Requirements
-- Python 3.10+
-- A valid OpenRouter/OpenAI-style API key
-
-### Setup
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# Set environment
-cp apps/mas/env.example .env   # then edit with your values
-# or export vars directly:
-# export OPENROUTER_API_KEY=...
-# export OPENAI_BASE_URL=https://openrouter.ai/api/v1### Run the chat UI
-python -m apps.mas.web.chat_ui \
-  --config apps/mas/configs/openrouter.yaml \
-  --server-name 127.0.0.1 \
-  --server-port 7860Open `http://127.0.0.1:7860`.
-
-## Benchmarks
-
-GSM8K (OpenRouter baseline):
-python -m apps.mas.scripts.run_gsm8k_baseline --n 10 --config apps/mas/configs/openrouter.yamlHotpotQA:
-python -m apps.mas.scripts.run_hotpotqa_baseline --n 5 --config apps/mas/configs/openrouter.yamlBBH Boolean:
-python -m apps.mas.scripts.run_bbh_baseline --n 5 --config apps/mas/configs/openrouter.yaml## Latent pipeline (HF local)
-
-Quick demo on GSM8K with latent seeding:
-python -m apps.mas.scripts.run_gsm8k_latent \
-  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --alignment apps/mas/latent/W_centered.npz \
-  --n 10 --latent_steps 8 --max_new_tokens 64Core steps:
-1) Encode prompt and run forward to collect last hidden state + KV
-2) Project hidden → input embeddings with W (mean-centered, normalized)
-3) Step embeddings through model using `past_key_values`
-4) Continue generation (sample first tokens then greedy)
-
-## Multi-answer behavior
-
-- If the prompt requests multiple quantities, the supervisor returns a compact JSON (e.g., `{"total_now": 18, "per_friend": 4, "remainder": 2}`).
-- The graph renders that JSON as lines for readability.
-- Single-number prompts return a bare number line only.
-
-## Extending
-
-- New worker:
-  - Add `apps/mas/agents/worker_<name>.py` with a concise persona and `run()`
-  - Instantiate and wire a dispatch node in `plan_graph.py`
-  - Update supervisor decomposition prompt to emit the new role
-- Per-role models:
-  - Set `worker_model` / `supervisor_*_model` in YAML
-  - or pass `model=...` on agent calls
-
-## Security
-
-- Do not commit real `.env` or API keys.
-- `.env` is loaded from project root or app-level `.env`; falls back to `env.example`.
-- Consider Git LFS for large artifacts (e.g., `.npy`, `.npz`, `.pt`, `.bin`, `.pdf`).
-
-## License
-
-Add a license (MIT/Apache-2.0) to clarify usage.

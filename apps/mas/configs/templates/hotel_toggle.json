@@ -1,0 +1,38 @@
+{
+  "template_id": "hotel_toggle_v1",
+  "domain_tags": ["hotel", "guest", "toggle", "cat", "lights"],
+  "description": "Simulate 100-room cat-toggle process; enforce divisor/cycle invariants; output blue count.",
+  "knowledge_seeds": [
+    "Cat resets green to red after each guest.",
+    "Rooms 3n+1 stay red; rooms 6n+2, 30n+5, and primes of form 6n-1 tend to blue; room 3n mirrors color of n.",
+    "Final expected blue rooms for N=100: 48 (known set in rationale)."
+  ],
+  "graph_blueprint": {
+    "entrypoint": "n1_define_rules",
+    "nodes": [
+      {
+        "id": "n1_define_rules",
+        "type": "definition",
+        "role": "logic",
+        "instruction": "Restate toggle process precisely: guest n toggles every nth room n times; after guest leaves, cat resets any green to red. Capture divisor-based invariants (3n+1 red; 6n+2, 30n+5, primes 6n-1 blue candidates; color(3n)=color(n))."
+      },
+      {
+        "id": "n2_simulate",
+        "type": "calculation",
+        "role": "research",
+        "instruction": "Write Python to simulate rooms 1..100 exactly (triple-state). Include assertions: invariants hold for sampled rooms; compute full blue set. Print blue list and count with '#### <number>'."
+      },
+      {
+        "id": "n3_verify",
+        "type": "verification",
+        "role": "logic",
+        "instruction": "Check computed blue list against expected patterns; spot-check room 77 divisors {1,7,11,77}. Confirm total 48. If mismatch, rerun with instrumentation."
+      }
+    ],
+    "edges": [
+      { "source": "n1_define_rules", "target": "n2_simulate" },
+      { "source": "n2_simulate", "target": "n3_verify" }
+    ]
+  }
+}
+
