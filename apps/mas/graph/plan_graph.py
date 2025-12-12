@@ -9,7 +9,7 @@ from langgraph.graph import END, StateGraph
 from pydantic import BaseModel
 
 from ..infra.openrouter.client import OpenRouterClient, OpenRouterConfig
-from ..agents.supervisor import SupervisorAgent, SubTask, Plan
+from ..agents.supervisor import SupervisorAgent, SubTask, Plan, _detect_question_type
 from ..agents.websearch import WebSearchAgent, WebEvidencePack
 from ..agents.worker_math import MathWorker
 from ..agents.worker_qa import QAWorker
@@ -241,6 +241,90 @@ def _format_grounding_fallback(extracted_answer: str, sources: List[str]) -> str
     else:
         src_lines = "- (no source URLs captured)"
     return f"**Direct Answer**: **{expected}**\n\n**Sources**:\n{src_lines}"
+
+
+def _is_ok_critique(critique: str) -> bool:
+    """
+    The critic is instructed to return exactly "OK" when everything looks correct,
+    but models sometimes return "OK." followed by extra text. Treat those as OK
+    unless they contain explicit issue markers.
+    """
+    c = (critique or "").strip()
+    if not c:
+        return True
+    cl = c.lower()
+    if cl == "ok":
+        return True
+    if not cl.startswith("ok"):
+        return False
+    # If it starts with OK but contains any explicit issue markers, treat as not OK.
+    issue_markers = [
+        "but",
+        "however",
+        "missing",
+        "incorrect",
+        "wrong",
+        "error",
+        "inconsistent",
+        "contradiction",
+        "hallucination",
+        "not addressed",
+        "needs",
+        "should",
+        "fix",
+        "problem",
+        "issue",
+    ]
+    return not any(m in cl for m in issue_markers)
+
+
+def _explicit_json_request(problem: str) -> bool:
+    p = (problem or "").lower()
+    return any(
+        k in p
+        for k in [
+            "json",
+            "in json",
+            "as json",
+            "return json",
+            "output json",
+            "respond in json",
+            "format json",
+        ]
+    )
+
+
+def _json_allowed(problem: str) -> bool:
+    """
+    Allow JSON output only when:
+    - the user explicitly asked for JSON, OR
+    - the detected question type expects structured multi-value output
+    """
+    if _explicit_json_request(problem):
+        return True
+    try:
+        return _detect_question_type(problem) == "multi_quantity"
+    except Exception:
+        return False
+
+
+def _looks_like_json_output(text: str) -> bool:
+    """
+    Heuristic: detect JSON-like outputs so we can reject them for normal chat answers.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    head = t.lstrip()
+    if head.lower().startswith("```json"):
+        return True
+    # Strip fenced block if present
+    if head.startswith("```"):
+        lines = head.splitlines()
+        if len(lines) >= 3 and lines[-1].strip().startswith("```"):
+            head = "\n".join(lines[1:-1]).strip()
+    head = head.lstrip()
+    return head.startswith("{") or head.startswith("[")
 
 
 def _compute_consensus(responses: List[Tuple[str, str]], numeric_expected: bool) -> Tuple[str, int]:
@@ -926,8 +1010,8 @@ def solve_with_budget(
             elif timed_out:
                 _emit_thinking("synthesize_timeout", "Synthesis timed out with no result")
             
-            # Attempt repair if needed and we have time AND critique found issues
-            if final and critique and critique.strip().upper() != "OK" and time_left() > 10:
+            # Attempt repair only if critique indicates issues (treat "OK." as OK)
+            if final and critique and not _is_ok_critique(critique) and time_left() > 10:
                 _emit_thinking("repair_attempt", "Attempting to repair based on critique")
                 original_final = final  # Preserve original answer
                 fixed, timed_out_repair = _run_with_timeout(
@@ -936,8 +1020,13 @@ def solve_with_budget(
                     default_value=None
                 )
                 if fixed and fixed.strip():
-                    final = fixed
-                    _emit_thinking("repair_success", f"Repair produced new answer: {final[:100]}...")
+                    # Guardrail: don't let repair switch non-JSON questions into JSON
+                    if _looks_like_json_output(fixed) and not _json_allowed(problem):
+                        final = original_final
+                        _emit_thinking("repair_rejected", "Repair returned JSON for a non-JSON question; keeping original answer")
+                    else:
+                        final = fixed
+                        _emit_thinking("repair_success", f"Repair produced new answer: {final[:100]}...")
                 else:
                     # Fallback: keep original answer if repair fails
                     final = original_final

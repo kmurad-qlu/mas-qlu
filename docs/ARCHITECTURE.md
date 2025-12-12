@@ -128,6 +128,108 @@ apps/mas/
     └── chat_ui.py             # Gradio chat interface
 ```
 
+### Architecture Diagrams (High-Level → Low-Level)
+
+The current architecture is best understood as **RA‑TGR + Web Evidence + Grounded Synthesis**.
+
+#### Diagram 1 — High-Level Pipeline (RA‑TGR + Web Evidence Layer)
+
+```mermaid
+flowchart TD
+  U[User Query] --> PG[plan_graph.solve_with_budget()]
+
+  PG --> WE[WebSearchAgent.build_evidence()]
+  WE --> WEP[WebEvidencePack\n(intent, extracted_answer, sources)]
+
+  PG --> RAG[HybridRetriever init\n(optional, wiki LanceDB)]
+  PG --> TGR{TGR enabled\nand template match?}
+  TGR -->|yes| GOT[GoTController.run()\n(retrieval nodes + swarm + verifier)]
+  GOT --> TGRANS[TGR Final Answer]
+
+  TGR -->|no| STD[Standard Supervisor Path]
+  STD --> DEC[Supervisor.decompose()]
+  DEC --> PLAN[Plan/SubTasks]
+
+  PLAN --> DISPATCH[Dispatch Subtasks\nSwarm + ResearchWorker]
+  WEP --> DISPATCH
+  DISPATCH --> RESULTS[Worker Results]
+
+  WEP --> CRIT[Supervisor.critique()]
+  RESULTS --> CRIT
+
+  WEP --> SYN[Supervisor.synthesize()]
+  RESULTS --> SYN
+
+  CRIT --> REPAIR{Repair needed?\n(_is_ok_critique)}
+  REPAIR -->|yes| RESYN[Supervisor.resynthesize_with_critique()]
+  REPAIR -->|no| FINAL[Final Answer]
+
+  RESYN --> JG{JSON output allowed?}
+  JG -->|no| FINAL
+  JG -->|yes| FINAL
+
+  FINAL --> GRND{Grounding check\n(extracted_answer present?)}
+  GRND -->|mismatch| FIX[Strict repair\nor deterministic fallback]
+  GRND -->|ok| OUT[Return Answer]
+  FIX --> OUT
+```
+
+#### Diagram 2 — Standard Path Sequence (solve_with_budget)
+
+```mermaid
+sequenceDiagram
+  participant User
+  participant PG as plan_graph.solve_with_budget
+  participant WS as WebSearchAgent
+  participant DDG as search_web (DuckDuckGo)
+  participant Sup as SupervisorAgent
+  participant Swarm as SwarmWorkerManager
+  participant Res as ResearchWorker
+  participant Ver as VerifierAgent
+
+  User->>PG: problem
+  PG->>WS: build_evidence(problem)
+  WS->>DDG: search_web(q1..qn, return_format="both")
+  DDG-->>WS: (formatted_text, WebResult[])
+  WS-->>PG: WebEvidencePack
+
+  PG->>Sup: decompose(problem)
+  Sup-->>PG: Plan(SubTasks)
+
+  loop for each ready SubTask
+    alt role == research
+      PG->>Res: run(instruction, context + web_evidence?)
+      Res-->>PG: result
+    else role in qa/logic
+      PG->>Swarm: run(instruction, context + web_evidence)
+      Swarm-->>PG: responses[]
+    end
+  end
+
+  PG->>Sup: critique(problem, results, web_evidence)
+  Sup-->>PG: critique_text
+
+  PG->>Sup: synthesize(problem, results, web_evidence)
+  Sup-->>PG: final_answer
+
+  opt critique indicates issues
+    PG->>Sup: resynthesize_with_critique(...)
+    Sup-->>PG: repaired_answer
+    PG->>PG: reject JSON repair if not allowed
+  end
+
+  opt extracted_answer present
+    PG->>PG: grounding_check + strict repair/fallback
+  end
+
+  opt numeric question
+    PG->>Ver: verify_numeric(problem, candidate, context)
+    Ver-->>PG: verified_candidate?
+  end
+
+  PG-->>User: final answer
+```
+
 ---
 
 ## Core Components
@@ -185,23 +287,31 @@ solve_with_budget(problem, config, timeout=300s)
     │       │       supervisor.decompose(problem) → Plan[SubTask...]
     │       │       Auto-injects: math worker for numeric, research for simulation
     │       │
-    │       ├─► [3.2] Parallel Dispatch
+    │       ├─► [3.2] Web Evidence Collection (evidence-first; no early-return)
+    │       │       websearch.build_evidence(problem) → WebEvidencePack
+    │       │
+    │       ├─► [3.3] Parallel Dispatch
     │       │       FOR each subtask:
     │       │           IF role == "research":
     │       │               researcher.run(instruction, context)
     │       │           ELSE:
-    │       │               swarm.run(instruction, role) → multi-model responses
+    │       │               swarm.run(instruction, role, context + web_evidence) → multi-model responses
     │       │       Cooperative rounds if disagreement detected
     │       │
-    │       ├─► [3.3] Critique Phase
-    │       │       supervisor.critique(results) → "OK" or issue_note
+    │       ├─► [3.4] Critique Phase
+    │       │       supervisor.critique(problem, results, web_evidence) → critique_text
+    │       │       NOTE: "OK." + commentary is treated as OK unless it contains explicit issue markers
     │       │
-    │       └─► [3.4] Synthesis
+    │       └─► [3.5] Synthesis
     │               question_type = _detect_question_type(problem)
-    │               answer = supervisor.synthesize(problem, results, question_type)
+    │               answer = supervisor.synthesize(problem, results, web_evidence)
     │               
-    │               IF issue_note != "OK":
-    │                   answer = supervisor.resynthesize_with_critique(...)
+    │               IF critique indicates issues:
+    │                   repaired = supervisor.resynthesize_with_critique(problem, results, critique, web_evidence)
+    │                   IF repaired looks like JSON AND JSON is not allowed:
+    │                       keep original answer
+    │                   ELSE:
+    │                       answer = repaired
     │
     └─► [4] Verification (for numeric)
             IF _looks_single_number_question(problem):
@@ -253,60 +363,31 @@ Budget Allocation:
 
 ### Overview
 
-The **WebSearchAgent** is a dedicated, isolated agent for answering questions that require **current/real-time information**. Unlike the static RAG system (which searches pre-indexed documents), the WebSearchAgent performs **live web searches** using DuckDuckGo to get the latest news and information.
+The **WebSearchAgent** is MAS’s dedicated component for **live web evidence collection** (DuckDuckGo news + web).  
+Unlike the static RAG system (which searches pre-indexed documents), WebSearchAgent pulls **fresh evidence** and packages it as a `WebEvidencePack` that is fed into:
 
-```text
-┌─────────────────────────────────────────────────────────────────┐
-│                    WebSearchAgent Pipeline                       │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  User Query: "Who is the current Chief Minister of KPK?"       │
-│                         │                                       │
-│                         ▼                                       │
-│  ┌─────────────────────────────────────────┐                   │
-│  │ _needs_current_info() Detection         │                   │
-│  │                                         │                   │
-│  │ Checks for:                             │                   │
-│  │ • Death/alive questions                 │                   │
-│  │ • Current position/role questions       │                   │
-│  │ • Latest version/release questions      │                   │
-│  │ • Recent dates (2024, 2025, etc.)       │                   │
-│  └─────────────────┬───────────────────────┘                   │
-│                    │                                            │
-│                    ▼ (If current info needed)                   │
-│  ┌─────────────────────────────────────────┐                   │
-│  │ Step 1: Generate Search Queries         │                   │
-│  │                                         │                   │
-│  │ LLM generates optimized queries:        │                   │
-│  │ • "current Chief Minister KPK 2025"     │                   │
-│  │ • "KPK CM news December 2025"           │                   │
-│  └─────────────────┬───────────────────────┘                   │
-│                    │                                            │
-│                    ▼                                            │
-│  ┌─────────────────────────────────────────┐                   │
-│  │ Step 2: Execute Web Searches            │                   │
-│  │                                         │                   │
-│  │ DuckDuckGo API (news + text search):    │                   │
-│  │ • News search first (prioritized)       │                   │
-│  │ • Text search as fallback               │                   │
-│  │ • Filter non-English results            │                   │
-│  │ • Extract dates for recency             │                   │
-│  └─────────────────┬───────────────────────┘                   │
-│                    │                                            │
-│                    ▼ (Results visible in Agent Thinking)        │
-│  ┌─────────────────────────────────────────┐                   │
-│  │ Step 3: Synthesize Answer               │                   │
-│  │                                         │                   │
-│  │ LLM synthesizes from search results:    │                   │
-│  │ • TRUSTS search results over training   │                   │
-│  │ • Prefers most recent dated articles    │                   │
-│  │ • Includes source attribution           │                   │
-│  └─────────────────┬───────────────────────┘                   │
-│                    │                                            │
-│                    ▼                                            │
-│  Final Answer: "Sohail Afridi (as of Dec 2025)"                │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+- QA/logic worker prompts (Swarm)
+- Supervisor critique + synthesis
+- A post-synthesis **grounding check**
+
+For lookup-style questions (e.g., *latest album*, *who performed song*, *current title holder*), WebSearchAgent performs **deterministic extraction + confidence scoring** and will **not invent entities** when evidence is insufficient.
+
+#### Diagram 3 — WebSearchAgent.build_evidence() (Intent → Multi-hop → Extraction)
+
+```mermaid
+flowchart TD
+  Q[Question] --> I[Detect intent\n(latest_album / who_sang / current_title / general_fact)]
+  I --> E[Extract entity\n(artist / song title) if applicable]
+  E --> H{Hop 1..N}
+  H --> QF[Generate query family\n(year + optional site: sources)]
+  QF --> SW[search_web(..., return_format=\"both\")]
+  SW --> R[WebResult[] + formatted text]
+  R --> D[Deduplicate by URL]
+  D --> C[Extract candidates + score\n(domain trust + repetition + pattern strength)]
+  C --> K{High-confidence candidate?}
+  K -->|yes| PACK[WebEvidencePack\nextracted_answer + sources]
+  K -->|no| H
+  H -->|max hops| PACK2[WebEvidencePack\n(no extracted answer)]
 ```
 
 ### Current Events Detection (`_needs_current_info`) (Legacy / Optional)
@@ -360,10 +441,10 @@ def _needs_current_info(problem: str) -> bool:
 |----------|---------------------|--------|
 | "Who is the current F1 champion?" | ✓ Yes | "current" + "champion" pattern |
 | "Who won the 2024 Super Bowl?" | ✓ Yes | "who won" + sports event |
-| "When did Charlie Kirk die?" | ✓ Yes | Death question pattern |
-| "Who is the current PM of UK?" | ✓ Yes | Current position pattern |
-| "Who is the CEO of Apple?" | ✓ Yes | "Who is" + role pattern |
-| "What is the latest ChatGPT model?" | ✓ Yes | "latest" + product |
+| "When did [public figure] die?" | ✓ Yes | Death question pattern |
+| "Who is the current PM of [country]?" | ✓ Yes | Current position pattern |
+| "Who is the CEO of [company]?" | ✓ Yes | "Who is" + role pattern |
+| "What is the latest version of [product]?" | ✓ Yes | "latest" + product |
 | "What is MQX?" | ✗ No | Definitional, use RAG |
 | "Who invented the telephone?" | ✗ No | Historical, static |
 | "What is the capital of France?" | ✗ No | Static geography fact |
@@ -422,7 +503,9 @@ Located in `apps/mas/tools/search.py`.
 
 The search tool now supports returning **structured results** for deterministic extraction:
 
-- `return_format="text"`: formatted string (default; backwards compatible)\n+- `return_format="results"`: `List[WebResult]`\n+- `return_format="both"`: `(formatted_text, List[WebResult])`
+- `return_format="text"`: formatted string (default; backwards compatible)
+- `return_format="results"`: `List[WebResult]`
+- `return_format="both"`: `(formatted_text, List[WebResult])`
 
 ```python
 def search_web(query: str, max_results: int = 5, return_format: Literal[...]) -> Union[str, List[WebResult], Tuple[str, List[WebResult]]]:
@@ -441,13 +524,13 @@ def search_web(query: str, max_results: int = 5, return_format: Literal[...]) ->
 
 **Example Output**:
 ```
-[1] [NEWS] (2025-12-11) Khyber Pakhtunkhwa CM denied permission to meet Imran Khan
-    Chief Minister Khyber Pakhtunkhwa Sohail Afridi was denied permission...
+[1] [NEWS] (YYYY-MM-DD) Government announces a new appointment / policy update
+    [Snippet text...]
     URL: https://www.msn.com/...
 
-[2] [NEWS] (2025-12-06) KP CM chairs ceremony for Miran Block shares transfer
-    Chief Minister Sohail Afridi on Saturday chaired the ceremony...
-    URL: https://www.pakistantoday.com.pk/...
+[2] [NEWS] (YYYY-MM-DD) Official statement on the change
+    [Snippet text...]
+    URL: https://www.example.com/...
 ```
 
 ### Multi-Hop Reasoning
@@ -455,29 +538,29 @@ def search_web(query: str, max_results: int = 5, return_format: Literal[...]) ->
 The WebSearchAgent implements **multi-hop reasoning** to handle cases where initial searches return irrelevant results:
 
 ```text
-Query: "Which is the latest album of Hassan Raheem?"
+Query: "Which is the latest album of Artist X?"
 
 STEP 1: Initial Search
-[websearch_queries] Search queries: ['Hassan Raheem latest album 2025 Spotify', ...]
-[websearch_result_content] Returns: Wikipedia articles about name "Hassan" etymology ❌
+[websearch_queries] Search queries: ['Artist X latest album 2025 Spotify', ...]
+[websearch_result_content] Returns: unrelated pages (e.g., name etymology / generic biography) ❌
 
 STEP 2: Relevance Detection
 [websearch_irrelevant] Search results appear irrelevant (name etymology instead of artist)
 
 STEP 3: Entity Extraction
-[websearch_name_extracted] Extracted entity name: 'Hassan Raheem'
+[websearch_name_extracted] Extracted entity name: 'Artist X'
 
 STEP 4: Alternative Queries
 [websearch_multihop] Trying alternative queries:
-  - '"Hassan Raheem" Pakistani singer latest album'
-  - '"Hassan Raheem" discography Spotify 2024 2025'
-  - 'Hassan Raheem Dil Kay Parday album'
+  - '"Artist X" latest album'
+  - 'site:open.spotify.com/album "Artist X"'
+  - 'site:music.apple.com "Artist X" album'
 
 STEP 5: Relevant Results Found!
-[websearch_result_content] Found: "Hasan Raheem steps into a new era with 
-second studio album 'Dil Kay Parday'" (October 2025) ✅
+[websearch_result_content] Found: "Artist X steps into a new era with 
+second studio album 'Album Y'" (YYYY-MM-DD) ✅
 
-FINAL: Synthesizes answer with "Dil Kay Parday" as the correct latest album
+FINAL: Extracts album title "Album Y" and answers with sources
 ```
 
 ### Deterministic Extraction + Confidence Scoring (No Guessing)
@@ -501,27 +584,54 @@ To prevent this, `solve_with_budget()` enforces a **grounding check**:
 - If WebSearchAgent extracts a high-confidence answer (e.g., latest album title), the final synthesized answer must contain it.
 - If not, the system attempts a strict repair pass; if that fails, it falls back to a deterministic answer + sources.
 
+#### Diagram 4 — Synthesis + Repair + Grounding Guard Rails
+
+```mermaid
+flowchart TD
+  W[WebEvidencePack (optional)] --> CTX[Context blocks]
+  R[Worker results (swarm format)] --> FMT[_format_results_for_synthesis\n(pick best + prefer final section)]
+  FMT --> CTX
+
+  CTX --> CRIT[Supervisor.critique()]
+  CTX --> SYN[Supervisor.synthesize()]
+
+  CRIT --> OK{_is_ok_critique?}
+  OK -->|yes| A1[Keep synthesized answer]
+  OK -->|no| RESYN[Supervisor.resynthesize_with_critique()]
+  RESYN --> J{looks_like_json_output\nAND JSON not allowed?}
+  J -->|yes| A1
+  J -->|no| A2[Use repaired answer]
+
+  A1 --> G{extracted_answer present?}
+  A2 --> G
+  G -->|no| OUT[Return]
+  G -->|yes| M{final contains extracted_answer?}
+  M -->|yes| OUT
+  M -->|no| SR[Strict repair]
+  SR --> SR2{contains extracted_answer?}
+  SR2 -->|yes| OUT
+  SR2 -->|no| FB[Deterministic fallback\n(extracted_answer + sources)]
+  FB --> OUT
+```
+
 ### Agent Thinking Process Visibility
 
 The WebSearchAgent emits detailed thinking events for debugging:
 
 ```text
-[websearch_start] 🌐 WebSearchAgent activated for: Who is the current CM of KPK?
-[websearch_query_gen] Generating search queries...
-[websearch_queries] Search queries: ['current Chief Minister KPK Pakistan 2025', ...]
-[websearch_executing] Executing search 1/3: current Chief Minister KPK Pakistan 2025
-[websearch_result_content] Search 'current Chief Minister...' returned:
-    [1] [NEWS] (2025-12-11) Khyber Pakhtunkhwa CM Sohail Afridi...
-    [2] [NEWS] (2025-11-30) K-P chief minister seeks parliamentary unity...
-[websearch_total_results] Total: 3 successful searches, 5940 chars of results
-[websearch_synthesize] Synthesizing answer from search results...
-[websearch_answer] Final answer: Based on the search results, the current CM is Sohail Afridi...
-[websearch_complete] WebSearchAgent finished. Answer length: 755 chars
+[web_evidence_start] Collecting web evidence (intent=current_title_holder, entity=None)
+[websearch_executing] Executing search 1/3: current [office] [region] 2025
+[websearch_result_content] Search 'current [office]...' returned:
+    [1] [NEWS] (YYYY-MM-DD) ...
+    [2] [WEB] ...
+[web_evidence_candidates] Top candidate: [Name] (confidence=0.78, domains=[...])
+[web_evidence_extracted] Extracted answer: [Name] (confidence=0.78)
+[web_evidence_complete] Web evidence ready: intent=current_title_holder, extracted=True
 ```
 
-### Synthesis with Trust-Search Prompt
+### Synthesis with Trust-Search Prompt (General Fact Lookups)
 
-The synthesis step uses a specially crafted prompt to prevent the LLM from contradicting search results:
+For `general_fact_lookup` questions (where deterministic extraction isn’t used), synthesis uses a trust-search prompt to prevent the LLM from contradicting evidence:
 
 ```python
 SYSTEM_WEBSEARCH = """
@@ -537,13 +647,14 @@ CRITICAL RULES:
 
 ### Test Results
 
-| Question | Before WebSearchAgent | After WebSearchAgent |
-|----------|----------------------|---------------------|
-| "When did Charlie Kirk die?" | "As of June 2024, he is alive" ❌ | "Charlie Kirk died in December 2025" ✅ |
-| "Which is the latest ChatGPT model?" | "GPT-4o" ❌ | "GPT-5.2 (December 2025)" ✅ |
-| "Who is the current CM of KPK?" | "Ali Amin Gandapur (June 2024)" ❌ | "Sohail Afridi (December 2025)" ✅ |
-| "Who is the current F1 champion?" | "Max Verstappen (2023)" ❌ | "Lando Norris (2025 champion)" ✅ |
-| "Which is Hassan Raheem's latest album?" | "Kamli (2023)" or hallucinated ❌ | "Dil Kay Parday (October 2025)" ✅ |
+The examples below are **illustrative** (actual answers depend on live search results and the date):
+
+| Question | Before Web Evidence Layer | After Web Evidence Layer |
+|----------|---------------------------|--------------------------|
+| "When did [public figure] die?" | relies on model memory ❌ | grounded in recent sources ✅ |
+| "What is the latest version of [product]?" | outdated cutoff ❌ | recent release info ✅ |
+| "Who is the current [office] of [region]?" | stale role holder ❌ | current sources ✅ |
+| "Which is [artist]'s latest album?" | hallucinated discography ❌ | extracted from discography sources ✅ |
 
 ### Detailed Answer Format
 
@@ -555,20 +666,17 @@ The WebSearchAgent now provides comprehensive answers with:
 
 Example output for "Who is the current F1 champion?":
 ```
-**Direct Answer**: The current Formula 1 World Champion is **Lando Norris**, 
-who won the 2025 Formula 1 World Drivers' Championship.
+**Direct Answer**: The current Formula 1 World Champion is **[Driver X]**.
 
 ### Key Details:
-- **Winner**: Lando Norris (McLaren)
-- **Championship Year**: 2025
-- **Date of Victory**: December 7, 2025 (Abu Dhabi Grand Prix)
-- **Age at Victory**: 26 years old
-- **How He Won**: Finished third place, enough to secure the title
-- **First F1 Title**: This is Norris's maiden championship
+- **Winner**: [Driver X] ([Team])
+- **Championship Year**: [YYYY]
+- **Date of Victory**: [YYYY-MM-DD]
+- **How They Won**: [brief summary from sources]
 
 ### Sources:
-1. [MSN - Lando Norris wins Formula 1 championship (2025-12-08)]
-2. [Yahoo Sports - Formula 1: Lando Norris wins 2025 world championship]
+1. [Source 1 - headline (date)]
+2. [Source 2 - headline (date)]
 ```
 
 ---
