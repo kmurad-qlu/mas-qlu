@@ -1,0 +1,46 @@
+{
+  "template_id": "rank1_matrices_v1",
+  "domain_tags": ["rank-1", "frobenius", "inner product", "admissible", "equiangular", "lines", "matrix"],
+  "description": "Map admissible rank-1 matrix sets to equiangular lines and apply known bounds plus small-case enumeration.",
+  "knowledge_seeds": [
+    "Rank-1 matrices A = v v^*, with Frobenius inner product <A_i, A_j>_F = |<v_i, v_j>|^2.",
+    "Equiangular lines bounds: real case ≤ (d+1 choose 2), complex case ≤ d^2; tighter Lemmens-Seidel bounds may apply depending on angle.",
+    "Admissible set size relates to equiangular line sets with constant pairwise magnitude."
+  ],
+  "graph_blueprint": {
+    "entrypoint": "n1_translate",
+    "nodes": [
+      {
+        "id": "n1_translate",
+        "type": "definition",
+        "role": "logic",
+        "instruction": "Translate the matrix condition to equiangular lines: show <A_i, A_j>_F = |<v_i, v_j>|^2 for rank-1 A_i = v_i v_i^*. State dimension parameters a,b and target k."
+      },
+      {
+        "id": "n2_bounds",
+        "type": "enumeration",
+        "role": "logic",
+        "instruction": "List relevant bounds: Gerzon (real/complex), Lemmens-Seidel relative bounds if applicable. Identify which bound is active given dimension/angle."
+      },
+      {
+        "id": "n3_small_case_check",
+        "type": "calculation",
+        "role": "research",
+        "instruction": "For small a,b (e.g., 2x2, 2x3), brute-force or randomized search with Python to test admissible k. Use Frobenius inner product checks; output feasible and infeasible k sets."
+      },
+      {
+        "id": "n4_aggregate",
+        "type": "aggregation",
+        "role": "logic",
+        "instruction": "Combine theoretical bounds and empirical checks. Conclude which k in 0..ab are not admissible. Output count as '#### <number>'."
+      }
+    ],
+    "edges": [
+      { "source": "n1_translate", "target": "n2_bounds" },
+      { "source": "n1_translate", "target": "n3_small_case_check" },
+      { "source": "n2_bounds", "target": "n4_aggregate" },
+      { "source": "n3_small_case_check", "target": "n4_aggregate" }
+    ]
+  }
+}
+

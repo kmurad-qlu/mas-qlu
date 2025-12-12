@@ -10,13 +10,15 @@ from pydantic import BaseModel
 
 from ..infra.openrouter.client import OpenRouterClient, OpenRouterConfig
 from ..agents.supervisor import SupervisorAgent, SubTask, Plan
+from ..agents.websearch import WebSearchAgent, WebEvidencePack
 from ..agents.worker_math import MathWorker
 from ..agents.worker_qa import QAWorker
 from ..agents.worker_logic import LogicWorker
 from ..agents.worker_researcher import ResearchWorker
 from ..agents.verifier import VerifierAgent
-from ..agents.worker_researcher import ResearchWorker
 from ..agents.swarm_worker import SwarmWorkerManager
+from .template_distiller import TemplateDistiller
+from .got_controller import GoTController
 import re
 import json
 import time
@@ -131,7 +133,7 @@ def _load_openrouter_config(path: str) -> OpenRouterConfig:
 def _looks_single_number_question(problem: str, plan: Plan | None) -> bool:
     """
     Heuristic: classify if the prompt expects a single numeric answer.
-    Tightened to avoid coercing multi-question prompts into a single number.
+    Tightened to avoid coercing multi-question prompts or definitional questions.
     """
     def _is_multi_query(text: str) -> bool:
         t = text.strip().lower()
@@ -146,8 +148,27 @@ def _looks_single_number_question(problem: str, plan: Plan | None) -> bool:
         return False
 
     p = problem.lower()
-    keywords = ("how many", "what is", "compute", "evaluate", "result", "value of")
-    if not any(k in p for k in keywords):
+    
+    # Exclude definitional/explanatory questions that start with "what is"
+    # These are asking for definitions, not numeric answers
+    definitional_patterns = [
+        "what is a ", "what is an ", "what is the ", "what are ",
+        "who is ", "who was ", "who are ", "who were ",
+        "explain ", "describe ", "define ", "tell me about ",
+        "what does ", "how does ", "why is ", "why are ", "why did ",
+    ]
+    if any(p.strip().startswith(pat) for pat in definitional_patterns):
+        return False
+    
+    # Exclude questions about people, places, things (not numeric)
+    if re.search(r"what is \w+\s*\(", p):  # "What is MQX (..." - definitional
+        return False
+    if re.search(r"what is \w+\s*\?$", p):  # "What is Python?" - definitional
+        return False
+    
+    # Only trigger for actual numeric computation questions
+    numeric_keywords = ("how many", "compute", "calculate", "evaluate", "result of", "value of", "sum of", "product of")
+    if not any(k in p for k in numeric_keywords):
         return False
 
     return True
@@ -194,6 +215,32 @@ def _normalize_text_answer(text: str) -> str:
     t = text.strip().lower()
     t = re.sub(r"\s+", " ", t)
     return t[:200]
+
+
+def _needs_grounding_repair(final_answer: str, extracted_answer: str) -> bool:
+    """
+    Return True if the synthesized final answer does not contain the extracted web answer.
+    This is a conservative grounding check used to prevent entity-flip hallucinations.
+    """
+    f = (final_answer or "").strip().lower()
+    e = (extracted_answer or "").strip().lower()
+    if not f or not e:
+        return False
+    return e not in f
+
+
+def _format_grounding_fallback(extracted_answer: str, sources: List[str]) -> str:
+    """
+    Format a deterministic fallback answer when grounding repair fails.
+    """
+    expected = (extracted_answer or "").strip()
+    if not expected:
+        return ""
+    if sources:
+        src_lines = "\n".join([f"- {u}" for u in sources[:6]])
+    else:
+        src_lines = "- (no source URLs captured)"
+    return f"**Direct Answer**: **{expected}**\n\n**Sources**:\n{src_lines}"
 
 
 def _compute_consensus(responses: List[Tuple[str, str]], numeric_expected: bool) -> Tuple[str, int]:
@@ -248,6 +295,9 @@ def build_graph(config_path: str) -> StateGraph:
     supervisor_model = _raw.get("supervisor_model") or default_model
     supervisor_fallback_model = _raw.get("supervisor_fallback_model") or default_fallback
     supervisor_secondary_fallback_model = _raw.get("supervisor_secondary_fallback_model")
+    worker_model = _raw.get("worker_model") or default_model
+    worker_fallback_model = _raw.get("worker_fallback_model") or default_fallback
+    worker_secondary_fallback_model = _raw.get("worker_secondary_fallback_model")
     verifier_model = _raw.get("verifier_model") or default_model
     verifier_fallback_model = _raw.get("verifier_fallback_model") or default_fallback
     verifier_secondary_fallback_model = _raw.get("verifier_secondary_fallback_model")
@@ -430,6 +480,19 @@ def solve_with_budget(
     coop_max_rounds = int(_raw.get("coop_max_rounds", 2))
     coop_min_agreement = int(_raw.get("coop_min_agreement", 2))
     coop_reconcile_prompt = str(_raw.get("coop_reconcile_prompt", "Peers disagree; reconcile and provide the single best answer."))
+    tgr_enabled = bool(_raw.get("tgr_enabled", True))
+    tgr_templates_path = _raw.get("tgr_templates_path", "apps/mas/configs/templates")
+    tgr_node_timeout = float(_raw.get("tgr_node_timeout", 90.0))
+    tgr_overall_timeout = float(_raw.get("tgr_overall_timeout", min(timeout_s, 240.0)))
+    
+    # RAG configuration
+    rag_enabled = bool(_raw.get("rag_enabled", True))
+    rag_db_path = _raw.get("rag_db_path", "apps/mas/data/wiki_lance")
+    rag_top_k = int(_raw.get("rag_top_k", 5))
+    rag_rrf_k = int(_raw.get("rag_rrf_k", 60))
+    rag_semantic_weight = float(_raw.get("rag_semantic_weight", 0.5))
+    rag_lexical_weight = float(_raw.get("rag_lexical_weight", 0.5))
+    rag_augment_seeds = bool(_raw.get("rag_augment_seeds", True))
 
     client = OpenRouterClient(cfg)
     supervisor = SupervisorAgent(
@@ -474,6 +537,30 @@ def solve_with_budget(
         secondary_fallback_model=verifier_secondary_fallback_model,
     )
     
+    # Initialize RAG retriever if enabled
+    retriever = None
+    if rag_enabled:
+        try:
+            import os as _os
+            if _os.path.exists(rag_db_path):
+                from ..rag.embeddings import CodestralEmbedder
+                from ..rag.retriever import HybridRetriever
+                
+                embedder = CodestralEmbedder()
+                retriever = HybridRetriever(
+                    db_path=rag_db_path,
+                    embedder=embedder,
+                    rrf_k=rag_rrf_k,
+                    semantic_weight=rag_semantic_weight,
+                    lexical_weight=rag_lexical_weight,
+                    thinking_callback=_emit_thinking,
+                )
+                _emit_thinking("rag_init", f"Hybrid RAG retriever initialized (db: {rag_db_path})")
+            else:
+                _emit_thinking("rag_skip", f"RAG database not found at {rag_db_path}, skipping RAG")
+        except Exception as e:
+            _emit_thinking("rag_init_error", f"Failed to initialize RAG: {str(e)[:150]}")
+    
     # Wire up thinking callbacks
     supervisor.set_thinking_callback(_emit_thinking)
     swarm.set_thinking_callback(_emit_thinking)
@@ -489,6 +576,65 @@ def solve_with_budget(
     # Per-operation timeout (use fraction of total budget)
     # Increased to 150s max for complex reasoning tasks
     per_op_timeout = min(timeout_s / 3, 150.0)  # Max 150s per operation
+
+    # NOTE: We intentionally DO NOT early-return from WebSearchAgent anymore.
+    # Web search is treated as an evidence layer that feeds QA/logic workers and Supervisor synthesis.
+
+    # Optional TGR fast-path when a template matches the problem
+    template_spec = None
+    template_score = 0
+    rag_context = []
+    if tgr_enabled and time_left() > 0:
+        try:
+            # Use RAG-enhanced distiller if retriever is available
+            if retriever:
+                from .template_distiller import RAGTemplateDistiller
+                distiller = RAGTemplateDistiller(
+                    tgr_templates_path,
+                    retriever=retriever,
+                    thinking_callback=_emit_thinking,
+                    rag_top_k=rag_top_k,
+                )
+                template_spec, template_score, rag_context = distiller.select_with_rag(problem)
+            else:
+                distiller = TemplateDistiller(tgr_templates_path, thinking_callback=_emit_thinking)
+                template_spec, template_score = distiller.select_with_score(problem)
+        except Exception as e:
+            _emit_thinking("tgr_distiller_error", f"TGR distiller failed: {str(e)[:150]}")
+
+    if tgr_enabled and template_spec and template_score >= 2 and time_left() > 0:
+        tpl_dict = {
+            "template_id": template_spec.template_id,
+            "domain_tags": template_spec.domain_tags,
+            "description": template_spec.description,
+            "knowledge_seeds": template_spec.knowledge_seeds,
+            "graph_blueprint": template_spec.graph_blueprint,
+        }
+        controller = GoTController(
+            problem=problem,
+            template=tpl_dict,
+            swarm=swarm,
+            researcher=researcher,
+            verifier=verifier,
+            knowledge_seeds=template_spec.knowledge_seeds,
+            node_timeout=min(tgr_node_timeout, time_left()),
+            overall_timeout=min(tgr_overall_timeout, time_left()),
+            thinking_callback=_emit_thinking,
+            retriever=retriever,  # Pass RAG retriever
+            augment_seeds_with_rag=rag_augment_seeds,
+        )
+        tgr_result = controller.run()
+        if tgr_result.final_answer and tgr_result.final_answer.strip():
+            _emit_thinking("tgr_final", f"TGR produced answer via {tgr_result.template_id}: {tgr_result.final_answer[:200]}")
+            return GraphState(
+                problem=problem,
+                plan=None,
+                results=[],
+                final_answer=tgr_result.final_answer,
+                critique_note=f"TGR:{tgr_result.template_id}",
+                thinking_log=get_thinking_log(),
+                scratchpad=tgr_result.trace,
+            )
     
     # Decompose
     if time_left() <= 0:
@@ -508,6 +654,37 @@ def solve_with_budget(
     except Exception as e:
         _emit_thinking("decompose_error", f"Decomposition failed: {str(e)[:200]}")
         plan = Plan(subtasks=[SubTask(id="step1", role="qa", instruction=problem, depends_on=[])])
+
+    # Build Web Evidence once per problem (used as an evidence layer for QA/logic tasks)
+    web_evidence: WebEvidencePack | None = None
+    web_evidence_for_context = ""
+    if time_left() > 15 and not _looks_single_number_question(problem, None):
+        try:
+            websearch_agent = WebSearchAgent(
+                client=client,
+                model_name=supervisor_model,
+                max_searches=3,
+                results_per_search=5,
+            )
+            websearch_agent.set_thinking_callback(_emit_thinking)
+            web_evidence, timed_out = _run_with_timeout(
+                lambda: websearch_agent.build_evidence(problem),
+                timeout_seconds=min(45.0, time_left()),
+                default_value=None,
+            )
+            if timed_out:
+                _emit_thinking("web_evidence_timeout", "Web evidence collection timed out; proceeding without web evidence")
+                web_evidence = None
+            elif web_evidence and web_evidence.combined_results and web_evidence.combined_results.strip():
+                # Keep full evidence in the thinking log; truncate for worker context
+                web_evidence_for_context = web_evidence.combined_results.strip()[:4500]
+                _emit_thinking(
+                    "web_evidence_ready",
+                    f"Web evidence collected: queries={len(web_evidence.queries)}, chars={len(web_evidence.combined_results)}"
+                )
+        except Exception as e:
+            _emit_thinking("web_evidence_error", f"Web evidence collection failed: {str(e)[:150]}")
+            web_evidence = None
 
     # Dispatch workers using swarm with MULTI-HOP REASONING
     # Results are keyed by subtask ID for dependency resolution
@@ -564,7 +741,7 @@ def solve_with_budget(
             if remaining <= 0:
                 break
             
-            # Build context from dependencies
+            # Build context from dependencies + (optional) web evidence
             context_parts = []
             if st.depends_on:
                 _emit_thinking("multihop_context", f"Subtask '{st.id}' depends on: {st.depends_on}")
@@ -574,6 +751,10 @@ def solve_with_budget(
                         dep_instruction = dep_st.instruction[:50] if dep_st else dep_id
                         context_parts.append(f"[Result from '{dep_id}' ({dep_instruction}...)]: {results_by_id[dep_id]}")
             
+            # Web Evidence layer: attach to QA/logic tasks by default
+            if web_evidence_for_context and st.role in ("qa", "logic"):
+                context_parts.append(f"[Web Evidence (search results)]:\n{web_evidence_for_context}")
+
             context = "\n".join(context_parts) if context_parts else ""
             
             # Build instruction with context
@@ -607,7 +788,7 @@ def solve_with_budget(
 
                 if not coop_enabled:
                     swarm_responses, timed_out = _run_with_timeout(
-                        lambda inst=full_instruction, role=st.role: swarm.run(inst, role=role, context=""),
+                        lambda inst=full_instruction, role=st.role: swarm.run(inst, role=role, context=context),
                         timeout_seconds=min(swarm_overall_timeout, remaining),
                         default_value=[]
                     )
@@ -711,7 +892,7 @@ def solve_with_budget(
         _emit_thinking("critique_phase", "Phase 3: Critiquing worker outputs")
         try:
             critique, timed_out = _run_with_timeout(
-                lambda: supervisor.critique(problem, results),
+                lambda: supervisor.critique(problem, results, web_evidence=web_evidence_for_context),
                 timeout_seconds=min(per_op_timeout, remaining),
                 default_value="OK"
             )
@@ -731,7 +912,7 @@ def solve_with_budget(
             # Give synthesis a reasonable minimum timeout
             synth_timeout = max(min(per_op_timeout, remaining) if remaining > 0 else 30, 30.0)
             synth_result, timed_out = _run_with_timeout(
-                lambda: supervisor.synthesize(problem, results),
+                lambda: supervisor.synthesize(problem, results, web_evidence=web_evidence_for_context),
                 timeout_seconds=synth_timeout,
                 default_value=""
             )
@@ -748,18 +929,56 @@ def solve_with_budget(
             # Attempt repair if needed and we have time AND critique found issues
             if final and critique and critique.strip().upper() != "OK" and time_left() > 10:
                 _emit_thinking("repair_attempt", "Attempting to repair based on critique")
-                fixed, _ = _run_with_timeout(
-                    lambda: supervisor.resynthesize_with_critique(problem, results, critique),
+                original_final = final  # Preserve original answer
+                fixed, timed_out_repair = _run_with_timeout(
+                    lambda: supervisor.resynthesize_with_critique(problem, results, critique, web_evidence=web_evidence_for_context),
                     timeout_seconds=min(30, max(time_left(), 15)),
                     default_value=None
                 )
                 if fixed and fixed.strip():
                     final = fixed
+                    _emit_thinking("repair_success", f"Repair produced new answer: {final[:100]}...")
+                else:
+                    # Fallback: keep original answer if repair fails
+                    final = original_final
+                    if timed_out_repair:
+                        _emit_thinking("repair_fallback", "Repair timed out, keeping original answer")
+                    else:
+                        _emit_thinking("repair_fallback", "Repair returned empty, keeping original answer")
+            # Post-synthesis grounding check: if web evidence extracted a concrete answer, ensure final contains it.
+            if web_evidence and web_evidence.extracted_answer and final and final.strip():
+                expected = web_evidence.extracted_answer.strip()
+                if _needs_grounding_repair(final, expected):
+                    _emit_thinking(
+                        "grounding_mismatch",
+                        f"Final answer does not contain extracted web answer '{expected}'. Attempting strict repair."
+                    )
+                    critique_note = (
+                        "GROUNDING CHECK FAILED.\n"
+                        f"- The web evidence extraction indicates the correct key fact is: '{expected}'.\n"
+                        "- Update the answer to include that exact value and cite sources from the Web Evidence.\n"
+                        "- Do NOT introduce alternative entities not present in Web Evidence."
+                    )
+                    repaired, _ = _run_with_timeout(
+                        lambda: supervisor.resynthesize_with_critique(problem, results, critique_note, web_evidence=web_evidence_for_context),
+                        timeout_seconds=min(25, max(time_left(), 10)),
+                        default_value=None,
+                    )
+                    if repaired and repaired.strip() and expected.lower() in repaired.lower():
+                        final = repaired.strip()
+                        _emit_thinking("grounding_repair_success", f"Grounding repair succeeded: {final[:120]}...")
+                    else:
+                        # Fallback: use deterministic extracted answer with sources
+                        final = _format_grounding_fallback(expected, web_evidence.extracted_sources)
+                        _emit_thinking("grounding_fallback", "Used deterministic extracted answer fallback.")
+
         except Exception as e:
             _emit_thinking("synthesize_error", f"Synthesis failed: {str(e)[:200]}")
 
-    # Numeric enforcement + verifier pass (non-deterministic but low temperature)
-    if _looks_single_number_question(problem, plan):
+    # Numeric enforcement + verifier pass (only for true numeric questions)
+    # Preserve the original answer to prevent corruption
+    if _looks_single_number_question(problem, plan) and final and final.strip():
+        original_final = final  # Preserve original in case verification fails
         extracted = _extract_numeric(final)
         if extracted:
             final = extracted
@@ -784,7 +1003,7 @@ def solve_with_budget(
                     timeout_seconds=min(30, remaining),
                     default_value=None
                 )
-                if not timed_out and v and v.strip() != final.strip():
+                if not timed_out and v and v.strip() and v.strip() != final.strip():
                     nv = _extract_numeric(v) or v.strip()
                     if nv:
                         final = nv
@@ -792,6 +1011,11 @@ def solve_with_budget(
                     _emit_thinking("verify_timeout", "Verification timed out, using current answer")
             except Exception as e:
                 _emit_thinking("verify_error", f"Verification failed: {str(e)[:200]}")
+        
+        # If verification somehow corrupted the answer, restore original
+        if not final or not final.strip():
+            _emit_thinking("verify_restore", "Verification corrupted answer, restoring original")
+            final = original_final
 
     # If timed out / no final yet, present best intermediate
     if not final or not final.strip():

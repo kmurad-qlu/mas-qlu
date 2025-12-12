@@ -31,3 +31,19 @@ coop_enabled: true
 coop_max_rounds: 2
 coop_min_agreement: 2
 coop_reconcile_prompt: "Peers disagree; reconcile and provide the single best answer."
+
+# Templated Graph Reasoning (TGR)
+tgr_enabled: true
+tgr_templates_path: "apps/mas/configs/templates"
+tgr_node_timeout: 90
+tgr_overall_timeout: 240
+
+# RAG Configuration (Retrieval-Augmented Generation)
+rag_enabled: true
+rag_db_path: "apps/mas/data/wiki_lance"
+rag_embedding_model: "mistralai/codestral-embed-2505"
+rag_top_k: 5
+rag_rrf_k: 60
+rag_semantic_weight: 0.5
+rag_lexical_weight: 0.5
+rag_augment_seeds: true

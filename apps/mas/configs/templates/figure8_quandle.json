@@ -1,0 +1,45 @@
+{
+  "template_id": "knot_figure8_quandle_v1",
+  "domain_tags": ["knot", "quandle", "figure eight", "coloring", "wirtinger"],
+  "description": "Check colorability of the figure-8 knot using connected quandles of order 4 (tetrahedral quandle).",
+  "knowledge_seeds": [
+    "Figure-8 knot (4_1) is amphicheiral and not tricolorable; smallest connected quandle that colors it is order 4 (tetrahedral quandle, conjugacy class of 3-cycles in A4).",
+    "Quandle axioms: idempotence x*x=x, right-invertibility (columns are permutations), self-distributivity (x*y)*z = (x*z)*(y*z).",
+    "Wirtinger relations: at each crossing, under_out = under_in * over."
+  ],
+  "graph_blueprint": {
+    "entrypoint": "n1_define_knot",
+    "nodes": [
+      {
+        "id": "n1_define_knot",
+        "type": "definition",
+        "role": "logic",
+        "instruction": "State figure-8 knot arcs and Wirtinger crossings (e.g., arcs 0-3; crossings (1,0,2), (3,2,0), (0,1,3), (2,3,1)). Summarize the quandle coloring constraint under_out = under_in * over."
+      },
+      {
+        "id": "n2_table",
+        "type": "definition",
+        "role": "logic",
+        "instruction": "Provide the multiplication table for the connected quandle of order 4 (tetrahedral quandle). Ensure it satisfies quandle axioms."
+      },
+      {
+        "id": "n3_solve",
+        "type": "calculation",
+        "role": "research",
+        "instruction": "Use Python to search colorings of the figure-8 knot with the order-4 quandle table. Verify quandle axioms and search assignments of arcs so that all crossings are satisfied. Return whether a non-trivial coloring exists and minimum size. End with '#### 4' if confirmed."
+      },
+      {
+        "id": "n4_verify",
+        "type": "verification",
+        "role": "logic",
+        "instruction": "Double-check the found coloring is non-trivial (not all arcs equal) and uses the connected quandle. If coloring fails, report failure and suggest larger n."
+      }
+    ],
+    "edges": [
+      { "source": "n1_define_knot", "target": "n3_solve" },
+      { "source": "n2_table", "target": "n3_solve" },
+      { "source": "n3_solve", "target": "n4_verify" }
+    ]
+  }
+}
+

@@ -1,0 +1,53 @@
+{
+  "template_id": "free_product_subgroups_v1",
+  "domain_tags": ["free product", "subgroup", "index 7", "C_2", "C_5", "homomorphism", "S_n", "generating function"],
+  "description": "Count subgroups of index 7 in C2 * C5 via homomorphism counts and generating-function identity.",
+  "knowledge_seeds": [
+    "Identity: sum_{n>=0} h_n(G)/n! t^n = exp( sum_{n>=1} s_n(G)/n t^n ).",
+    "For free product G1*G2: h_n(G) = h_n(G1) * h_n(G2).",
+    "For cyclic C_k: generating function exp( sum_{d|k} t^d / d ); expand to t^7 for k in {2,5}.",
+    "Expected s_7(C2*C5) = 56."
+  ],
+  "graph_blueprint": {
+    "entrypoint": "n1_recall_identity",
+    "nodes": [
+      {
+        "id": "n1_recall_identity",
+        "type": "definition",
+        "role": "logic",
+        "instruction": "State generating-function identity linking h_n and s_n; note h_n(C2*C5)=h_n(C2)h_n(C5)."
+      },
+      {
+        "id": "n2_expand_cyclic",
+        "type": "calculation",
+        "role": "research",
+        "instruction": "Use Python to expand exp(sum_{d|k} t^d/d) for k=2 and k=5 up to t^7 to get h_n(C2), h_n(C5). Return coefficients list."
+      },
+      {
+        "id": "n3_multiply",
+        "type": "calculation",
+        "role": "research",
+        "instruction": "Multiply series of h_n(C2) and h_n(C5) termwise (up to n=7) to get h_n(C2*C5)."
+      },
+      {
+        "id": "n4_log_extract",
+        "type": "calculation",
+        "role": "research",
+        "instruction": "Take log of resulting series up to t^7; extract s_n via coefficient*n. Output s_7 and end with '#### <number>'. Expect 56."
+      },
+      {
+        "id": "n5_verify",
+        "type": "verification",
+        "role": "logic",
+        "instruction": "Cross-check s_7=56 and that intermediate h_n align with OEIS sequences (A000085 for k=2, A052501 for k=5)."
+      }
+    ],
+    "edges": [
+      { "source": "n1_recall_identity", "target": "n2_expand_cyclic" },
+      { "source": "n2_expand_cyclic", "target": "n3_multiply" },
+      { "source": "n3_multiply", "target": "n4_log_extract" },
+      { "source": "n4_log_extract", "target": "n5_verify" }
+    ]
+  }
+}
+
