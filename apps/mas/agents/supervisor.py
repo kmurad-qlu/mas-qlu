@@ -591,7 +591,9 @@ class SupervisorAgent:
                 "Incorporate the critique to repair any mistakes or missing elements.\n"
                 "OUTPUT POLICY:\n"
                 "- Provide a clear, complete, and accurate answer.\n"
-                "- Be concise but thorough."
+                "- Be concise but thorough.\n"
+                "- IMPORTANT: Do NOT output JSON unless the user explicitly requested JSON.\n"
+                "- Prefer natural prose with short paragraphs and, if helpful, a small bullet list."
             )
         
         web_section = ""

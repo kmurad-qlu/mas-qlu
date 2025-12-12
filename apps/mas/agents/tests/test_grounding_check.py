@@ -16,3 +16,24 @@ def test_format_grounding_fallback_includes_sources():
     assert "https://example.com/a" in out
 
 
+def test_ok_critique_normalization():
+    from apps.mas.graph.plan_graph import _is_ok_critique
+
+    assert _is_ok_critique("OK") is True
+    assert _is_ok_critique("OK.") is True
+    assert _is_ok_critique("OK. Looks good and complete.") is True
+    assert _is_ok_critique("OK, but missing the ban detail.") is False
+
+
+def test_json_repair_guard_helpers():
+    from apps.mas.graph.plan_graph import _json_allowed, _looks_like_json_output
+
+    assert _looks_like_json_output('```json\\n[{\"a\": 1}]\\n```') is True
+    assert _looks_like_json_output('[{\"a\": 1}]') is True
+    assert _looks_like_json_output('Answer: hello') is False
+
+    assert _json_allowed("Return JSON") is True
+    assert _json_allowed("List the planets") is True  # multi_quantity heuristic
+    assert _json_allowed("Which is Ranveer Singh's latest movie?") is False
+
+
