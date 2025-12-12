@@ -136,42 +136,43 @@ The current architecture is best understood as **RA‑TGR + Web Evidence + Groun
 
 ```mermaid
 flowchart TD
-  U[User Query] --> PG[plan_graph.solve_with_budget]
+  U["User Query"] --> PG["plan_graph.solve_with_budget()"]
 
-  PG --> WE[WebSearchAgent.build_evidence]
-  WE --> WEP[WebEvidencePack-intent, extracted_answer, sources]
+  PG --> WE["WebSearchAgent.build_evidence()"]
+  WE --> WEP["WebEvidencePack\n(intent, extracted_answer, sources)"]
 
-  PG --> RAG[HybridRetriever init-optional, wiki LanceDB]
-  PG --> TGR{TGR enabled\nand template match?}
-  TGR -->|yes| GOT[GoTController.run -retrieval nodes + swarm + verifier]
-  GOT --> TGRANS[TGR Final Answer]
+  PG --> RAG["HybridRetriever init\n(optional, wiki LanceDB)"]
+  PG --> TGR{"TGR enabled\nand template match?"}
+  TGR -->|yes| GOT["GoTController.run()\n(retrieval nodes + swarm + verifier)"]
+  GOT --> TGRANS["TGR Final Answer"]
 
-  TGR -->|no| STD[Standard Supervisor Path]
-  STD --> DEC[Supervisor.decompose]
-  DEC --> PLAN[Plan/SubTasks]
+  TGR -->|no| STD["Standard Supervisor Path"]
+  STD --> DEC["Supervisor.decompose()"]
+  DEC --> PLAN["Plan/SubTasks"]
 
-  PLAN --> DISPATCH[Dispatch Subtasks\nSwarm + ResearchWorker]
+  PLAN --> DISPATCH["Dispatch Subtasks\nSwarm + ResearchWorker"]
   WEP --> DISPATCH
-  DISPATCH --> RESULTS[Worker Results]
+  DISPATCH --> RESULTS["Worker Results"]
 
-  WEP --> CRIT[Supervisor.critique]
+  WEP --> CRIT["Supervisor.critique()"]
   RESULTS --> CRIT
 
-  WEP --> SYN[Supervisor.synthesize]
+  WEP --> SYN["Supervisor.synthesize()"]
   RESULTS --> SYN
 
-  CRIT --> REPAIR{Repair needed? -_is_ok_critique}
-  REPAIR -->|yes| RESYN[Supervisor.resynthesize_with_critique]
-  REPAIR -->|no| FINAL[Final Answer]
+  CRIT --> REPAIR{"Repair needed?\n(_is_ok_critique)"}
+  REPAIR -->|yes| RESYN["Supervisor.resynthesize_with_critique()"]
+  REPAIR -->|no| FINAL["Final Answer"]
 
-  RESYN --> JG{JSON output allowed?}
+  RESYN --> JG{"JSON output allowed?"}
   JG -->|no| FINAL
   JG -->|yes| FINAL
 
-  FINAL --> GRND{Grounding check extracted_answer present?}
-  GRND -->|mismatch| FIX[Strict repair\nor deterministic fallback]
-  GRND -->|ok| OUT[Return Answer]
+  FINAL --> GRND{"Grounding check\n(extracted_answer present?)"}
+  GRND -->|mismatch| FIX["Strict repair\nor deterministic fallback"]
+  GRND -->|ok| OUT["Return Answer"]
   FIX --> OUT
+
 
 ```
 
