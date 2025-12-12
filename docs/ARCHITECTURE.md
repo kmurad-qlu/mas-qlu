@@ -378,18 +378,18 @@ For lookup-style questions (e.g., *latest album*, *who performed song*, *current
 
 ```mermaid
 flowchart TD
-  Q[Question] --> I[Detect intent\n(latest_album / who_sang / current_title / general_fact)]
-  I --> E[Extract entity\n(artist / song title) if applicable]
-  E --> H{Hop 1..N}
-  H --> QF[Generate query family\n(year + optional site: sources)]
-  QF --> SW[search_web(..., return_format=\"both\")]
-  SW --> R[WebResult[] + formatted text]
-  R --> D[Deduplicate by URL]
-  D --> C[Extract candidates + score\n(domain trust + repetition + pattern strength)]
-  C --> K{High-confidence candidate?}
-  K -->|yes| PACK[WebEvidencePack\nextracted_answer + sources]
+  Q["Question"] --> I["Detect intent\nlatest_album / who_sang / current_title / general_fact"]
+  I --> E["Extract entity\nartist / song title (if applicable)"]
+  E --> H{"Hop 1..N"}
+  H --> QF["Generate query family\nyear + optional site:sources"]
+  QF --> SW["search_web(..., return_format='both')"]
+  SW --> R["WebResult[] + formatted text"]
+  R --> D["Deduplicate by URL"]
+  D --> C["Extract candidates + score\ndomain trust + repetition + pattern strength"]
+  C --> K{"High-confidence candidate?"}
+  K -->|yes| PACK["WebEvidencePack\nextracted_answer + sources"]
   K -->|no| H
-  H -->|max hops| PACK2[WebEvidencePack\n(no extracted answer)]
+  H -->|max hops| PACK2["WebEvidencePack\n(no extracted answer)"]
 ```
 
 ### Current Events Detection (`_needs_current_info`) (Legacy / Optional)
@@ -590,30 +590,31 @@ To prevent this, `solve_with_budget()` enforces a **grounding check**:
 
 ```mermaid
 flowchart TD
-  W[WebEvidencePack (optional)] --> CTX[Context blocks]
-  R[Worker results (swarm format)] --> FMT[_format_results_for_synthesis\n(pick best + prefer final section)]
+  W["WebEvidencePack (optional)"] --> CTX["Context blocks"]
+  R["Worker results (swarm format)"] --> FMT["_format_results_for_synthesis\npick best + prefer final section"]
   FMT --> CTX
 
-  CTX --> CRIT[Supervisor.critique()]
-  CTX --> SYN[Supervisor.synthesize()]
+  CTX --> CRIT["Supervisor.critique()"]
+  CTX --> SYN["Supervisor.synthesize()"]
 
-  CRIT --> OK{_is_ok_critique?}
-  OK -->|yes| A1[Keep synthesized answer]
-  OK -->|no| RESYN[Supervisor.resynthesize_with_critique()]
-  RESYN --> J{looks_like_json_output\nAND JSON not allowed?}
+  CRIT --> OK{"_is_ok_critique?"}
+  OK -->|yes| A1["Keep synthesized answer"]
+  OK -->|no| RESYN["Supervisor.resynthesize_with_critique()"]
+  RESYN --> J{"looks_like_json_output\nAND JSON not allowed?"}
   J -->|yes| A1
-  J -->|no| A2[Use repaired answer]
+  J -->|no| A2["Use repaired answer"]
 
-  A1 --> G{extracted_answer present?}
+  A1 --> G{"extracted_answer present?"}
   A2 --> G
-  G -->|no| OUT[Return]
-  G -->|yes| M{final contains extracted_answer?}
+  G -->|no| OUT["Return"]
+  G -->|yes| M{"final contains extracted_answer?"}
   M -->|yes| OUT
-  M -->|no| SR[Strict repair]
-  SR --> SR2{contains extracted_answer?}
+  M -->|no| SR["Strict repair"]
+  SR --> SR2{"contains extracted_answer?"}
   SR2 -->|yes| OUT
-  SR2 -->|no| FB[Deterministic fallback\n(extracted_answer + sources)]
+  SR2 -->|no| FB["Deterministic fallback\nextracted_answer + sources"]
   FB --> OUT
+
 ```
 
 ### Agent Thinking Process Visibility
