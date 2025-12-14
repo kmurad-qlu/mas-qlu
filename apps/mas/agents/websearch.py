@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from ..infra.openrouter.client import OpenRouterClient
 from ..tools.search import WebResult, search_web
+from ..tools.fetch import fetch_url_text, select_relevant_passages, FetchResult
 
 
 # Get current date for search queries
@@ -62,7 +63,7 @@ Example structure:
 Do NOT second-guess or contradict the search results with your training data.
 """
 
-SEARCH_QUERY_PROMPT = """Generate 3-4 effective web search queries to find current information about this question.
+SEARCH_QUERY_PROMPT = """Generate 3-4 effective web search queries to find information about this question.
 
 Question: {question}
 
@@ -71,7 +72,7 @@ Current date: {current_date}
 Output ONLY the search queries, one per line. No explanations or numbering.
 
 CRITICAL TIPS for effective queries:
-- Include the current year ({year})
+- Include the current year ({year}) ONLY if the question is about current events / latest status.
 - For MUSICIANS/ARTISTS: add "discography", "Spotify", "new album", "latest release", "singer", "artist"
 - For SPORTS: add the sport name and "champion", "winner", year
 - For PEOPLE: add their profession/role to disambiguate (e.g., "singer", "politician", "CEO")
@@ -134,6 +135,10 @@ class WebEvidencePack:
     # Debugging: candidate list (highest score first)
     candidates: List[Dict[str, Any]] = field(default_factory=list)
 
+    # Optional: fetched page extracts (for deeper reasoning beyond snippets)
+    fetched_pages: List[Dict[str, Any]] = field(default_factory=list)
+    fetched_combined: str = ""
+
 
 class WebSearchAgent:
     """
@@ -179,7 +184,7 @@ class WebSearchAgent:
         if self._thinking_callback:
             self._thinking_callback(stage, content)
     
-    def _generate_search_queries(self, question: str) -> List[str]:
+    def _generate_search_queries(self, question: str, bias_current_year: bool = True) -> List[str]:
         """Generate optimal search queries for the question."""
         self._emit("websearch_query_gen", f"Generating search queries for: {question[:100]}...")
         
@@ -214,19 +219,20 @@ class WebSearchAgent:
             
             # Ensure we have at least one query
             if not queries:
-                queries = self._generate_fallback_queries(question)
+                queries = self._generate_fallback_queries(question, bias_current_year=bias_current_year)
             
-            # Replace old years with current year
-            queries = [self._fix_year_in_query(q) for q in queries]
+            # Replace old years with current year only for genuinely current-events queries
+            if bias_current_year:
+                queries = [self._fix_year_in_query(q) for q in queries]
             
             self._emit("websearch_queries", f"Search queries: {queries[:self.max_searches]}")
             return queries[:self.max_searches]
             
         except Exception as e:
             self._emit("websearch_query_error", f"Query generation failed: {str(e)[:100]}, using fallback queries")
-            return self._generate_fallback_queries(question)
+            return self._generate_fallback_queries(question, bias_current_year=bias_current_year)
     
-    def _generate_fallback_queries(self, question: str) -> List[str]:
+    def _generate_fallback_queries(self, question: str, bias_current_year: bool = True) -> List[str]:
         """Generate fallback queries when LLM query generation fails."""
         # Extract key terms from question
         q = question.lower()
@@ -235,11 +241,17 @@ class WebSearchAgent:
         for word in ["what is", "who is", "when did", "which is", "where is", "how", "the", "a", "an"]:
             q = q.replace(word, "")
         q = q.strip("? ").strip()
-        
+        if bias_current_year:
+            return [
+                f"{q} {self._current_year} news",
+                f"{q} {self._current_date}",
+                f"{q} latest news today"
+            ]
+        # Historical/general fallback: do not force current-year framing.
         return [
-            f"{q} {self._current_year} news",
-            f"{q} {self._current_date}",
-            f"{q} latest news today"
+            q,
+            f"{q} wikipedia",
+            f"\"{q}\"",
         ]
     
     def _generate_alternative_queries(self, question: str, failed_queries: List[str]) -> List[str]:
@@ -420,6 +432,95 @@ class WebSearchAgent:
         combined = "\n\n".join(blocks) if blocks else "No search results found."
         self._emit("websearch_total_results", f"Total unique results: {len(deduped)} (from {len(queries)} queries)")
         return combined, deduped
+
+    def _pick_urls_to_fetch(self, results: List[WebResult], max_pages: int = 4) -> List[Tuple[str, str]]:
+        """
+        Pick a small set of URLs to fetch for deeper in-page evidence.
+        Returns (url, title) pairs. Diversifies by domain.
+        """
+        scored: List[Tuple[float, str, str, str]] = []
+        for r in results:
+            u = (r.url or "").strip()
+            if not u or u == "#" or u.startswith("javascript:"):
+                continue
+            dom = self._domain(u)
+            trust = self._trust_score(dom)
+            recency_bonus = 0.05 if (r.date or "").strip() else 0.0
+            source_bonus = 0.02 if (r.source or "").upper() == "NEWS" else 0.0
+            score = trust + recency_bonus + source_bonus
+            scored.append((score, dom, u, (r.title or "").strip()))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        picked: List[Tuple[str, str]] = []
+        seen_domains: set[str] = set()
+        seen_urls: set[str] = set()
+        for _, dom, u, title in scored:
+            if u in seen_urls:
+                continue
+            # prefer domain diversity
+            if dom in seen_domains and len(seen_domains) < max_pages:
+                continue
+            seen_urls.add(u)
+            seen_domains.add(dom)
+            picked.append((u, title))
+            if len(picked) >= max_pages:
+                break
+        return picked
+
+    def _fetch_pages_for_question(
+        self,
+        question: str,
+        results: List[WebResult],
+        max_pages: int = 4,
+        max_chars_per_page: int = 4500,
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """
+        Fetch top URLs and extract relevant passages for the question.
+        """
+        cache: Dict[str, FetchResult] = {}
+        picked = self._pick_urls_to_fetch(results, max_pages=max_pages)
+        if not picked:
+            return [], ""
+
+        pages: List[Dict[str, Any]] = []
+        blocks: List[str] = []
+        for url, title in picked:
+            self._emit("web_fetch_start", f"Fetching URL for evidence: {url}")
+            fr = fetch_url_text(url, timeout_s=10.0, max_bytes=2_000_000, cache=cache)
+            if fr.error or not fr.text:
+                self._emit("web_fetch_error", f"Fetch failed: {url} ({fr.error})")
+                pages.append(
+                    {
+                        "url": url,
+                        "final_url": fr.final_url,
+                        "title": title,
+                        "error": fr.error or "empty",
+                        "chars": 0,
+                    }
+                )
+                continue
+
+            snippet = select_relevant_passages(fr.text, question, max_chars=max_chars_per_page)
+            self._emit("web_fetch_ok", f"Fetched {url} chars={len(fr.text)} snippet_chars={len(snippet)} status={fr.status_code}")
+            pages.append(
+                {
+                    "url": url,
+                    "final_url": fr.final_url,
+                    "title": title,
+                    "status_code": fr.status_code,
+                    "content_type": fr.content_type,
+                    "chars": len(fr.text),
+                    "snippet": snippet,
+                }
+            )
+            if snippet:
+                hdr = f"=== Fetched URL: {url} ==="
+                if title:
+                    hdr += f"\nTitle: {title}"
+                blocks.append(f"{hdr}\n{snippet}")
+
+        combined = ("\n\n".join(blocks)).strip()
+        return pages, combined
 
     def _norm(self, s: str) -> str:
         s2 = re.sub(r"\s+", " ", (s or "")).strip().lower()
@@ -759,14 +860,17 @@ class WebSearchAgent:
             return [f"{q} official site", f"{q} standings {y}", f"{q} results {y}"]
 
         # general_fact_lookup
+        # For general/historical questions, do NOT force current-year in hop 1.
+        # Add year only in later hops if needed.
         if hop == 1:
-            # Combine LLM-generated queries with a deterministic fallback
-            llm_qs = self._generate_search_queries(q)
-            det = [f"{q} {y}", q]
+            # Combine LLM-generated queries with a deterministic fallback (yearless)
+            llm_qs = self._generate_search_queries(q, bias_current_year=False)
+            det = [q, f"site:wikipedia.org {q}"]
             return list(dict.fromkeys(llm_qs + det))  # preserve order, unique
         if hop == 2:
-            return self._generate_fallback_queries(q)
-        return [q]
+            # If still missing, try adding the current year as a later-hop disambiguator
+            return self._generate_fallback_queries(q, bias_current_year=True)
+        return [f"{q} {y}", q]
 
     def _candidate_is_confident(self, cand: Dict[str, Any]) -> bool:
         """
@@ -922,6 +1026,16 @@ class WebSearchAgent:
 
         combined_results = ("\n\n".join(blocks)).strip() if blocks else "No search results found."
 
+        # Fetch deeper in-page evidence for top URLs (not just DDG snippets)
+        fetched_pages, fetched_combined = self._fetch_pages_for_question(
+            question,
+            all_results,
+            max_pages=4,
+            max_chars_per_page=4500,
+        )
+        if fetched_combined:
+            combined_results = (combined_results + "\n\n" + "=== Fetched Page Evidence ===\n" + fetched_combined).strip()
+
         pack = WebEvidencePack(
             question=question,
             intent=intent,
@@ -933,6 +1047,8 @@ class WebSearchAgent:
             extracted_confidence=extracted_confidence,
             extracted_sources=extracted_sources,
             candidates=candidates[:10] if candidates else [],
+            fetched_pages=fetched_pages,
+            fetched_combined=fetched_combined,
         )
 
         self._emit(

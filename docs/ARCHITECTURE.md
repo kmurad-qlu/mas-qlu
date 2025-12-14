@@ -14,11 +14,12 @@ This document provides a comprehensive deep-dive into MAS architecture, covering
 6. [Retrieval-Augmented Generation (RAG) System](#retrieval-augmented-generation-rag-system)
 7. [Templated Graph Reasoning (TGR)](#templated-graph-reasoning-tgr)
 8. [RA-TGR: The Unified Pipeline](#ra-tgr-the-unified-pipeline)
-9. [Question Type Detection & Output Formatting](#question-type-detection--output-formatting)
-10. [Consensus & Verification](#consensus--verification)
-11. [Configuration & Models](#configuration--models)
-12. [Entry Points & Benchmarks](#entry-points--benchmarks)
-13. [Code Organization](#code-organization)
+9. [TGR Pipeline Enhancements](#tgr-pipeline-enhancements)
+10. [Question Type Detection & Output Formatting](#question-type-detection--output-formatting)
+11. [Consensus & Verification](#consensus--verification)
+12. [Configuration & Models](#configuration--models)
+13. [Entry Points & Benchmarks](#entry-points--benchmarks)
+14. [Code Organization](#code-organization)
 
 ---
 
@@ -26,12 +27,15 @@ This document provides a comprehensive deep-dive into MAS architecture, covering
 
 MAS is a sophisticated multi-agent reasoning system that combines:
 
-- **Real-Time Web Search**: Dedicated WebSearchAgent for current events and live information
+- **Real-Time Web Search**: Dedicated WebSearchAgent for current events and live information (toggle-controlled)
 - **Hybrid Fusion RAG**: Semantic (dense vector) + Lexical (BM25) retrieval with Reciprocal Rank Fusion
+- **Wikipedia Crawling**: Automatic fetching and extraction of full Wikipedia page content from RAG URLs
+- **Timeline Reasoning**: Hybrid LLM extraction + deterministic constraint solving for temporal questions
 - **Templated Graph Reasoning (TGR)**: Buffer-of-Thought templates + Graph-of-Thought execution
+- **Factual Question Detection**: Prevents factual/QA questions from being misrouted to math templates
 - **Multi-Model Swarm Consensus**: Parallel LLM calls with cooperative reconciliation
 - **Code-First Research**: Ouroboros loop with sandboxed Python execution
-- **Intelligent Output Formatting**: Question-type-aware synthesis for optimal response formats
+- **Intelligent Output Formatting**: Question-type-aware synthesis with RAG citations
 
 ```text
 User Query
@@ -86,7 +90,7 @@ User Query
 apps/mas/
 ├── agents/                    # Worker agents and supervisor
 │   ├── supervisor.py          # Orchestration, decomposition, synthesis
-│   ├── websearch.py           # Real-time web search agent (NEW)
+│   ├── websearch.py           # Real-time web search agent
 │   ├── swarm_worker.py        # Multi-model parallel consensus
 │   ├── worker_math.py         # Mathematical reasoning
 │   ├── worker_logic.py        # Logical reasoning
@@ -96,8 +100,11 @@ apps/mas/
 │
 ├── graph/                     # TGR and orchestration
 │   ├── plan_graph.py          # Main entry: solve_with_budget()
-│   ├── template_distiller.py  # Template selection (keyword + RAG)
-│   ├── got_controller.py      # Graph-of-Thought execution
+│   ├── template_distiller.py  # Template selection (keyword + RAG + dynamic gen)
+│   ├── template_generator.py  # Dynamic template generation via LLM
+│   ├── got_controller.py      # Graph-of-Thought execution with backtracking
+│   ├── node_verifier.py       # Type-specific node output verification
+│   ├── backtrack_manager.py   # Intelligent retry with state management
 │   └── archetype_verifier.py  # Domain-specific answer clamping
 │
 ├── rag/                       # Retrieval-Augmented Generation
@@ -105,7 +112,16 @@ apps/mas/
 │   ├── indexer.py             # Wikipedia → LanceDB ingestion
 │   ├── retriever.py           # Hybrid fusion search (RRF)
 │   ├── chunker.py             # Document chunking strategies
+│   ├── evidence.py            # RAGEvidencePack for structured citations
 │   └── tests/                 # Smoke tests for RAG
+│
+├── learning/                  # Distillation loop for self-improvement
+│   ├── trace_recorder.py      # Execution trace capture
+│   ├── trace_store.py         # Trace persistence and querying
+│   ├── pattern_analyzer.py    # Pattern extraction from traces
+│   ├── prompt_enhancer.py     # Prompt augmentation with patterns
+│   ├── distillation_manager.py # Coordination of learning loop
+│   └── tests/                 # Tests for learning components
 │
 ├── infra/                     # Infrastructure
 │   ├── openrouter/client.py   # LLM API client with retries
@@ -114,15 +130,24 @@ apps/mas/
 │
 ├── tools/                     # Execution tools
 │   ├── executor.py            # Sandboxed Python executor
-│   └── search.py              # DuckDuckGo web search (NEW)
+│   ├── search.py              # DuckDuckGo web search
+│   ├── fetch.py               # URL fetching & HTML-to-text extraction
+│   └── timeline.py            # Hybrid timeline extraction & constraint solving
 │
 ├── configs/                   # Configuration
 │   ├── openrouter.yaml        # Main config (models, RAG, TGR)
+│   ├── learning.yaml          # Distillation and backtracking config
 │   └── templates/             # TGR template blueprints
 │       ├── hotel_toggle_v1.json
 │       ├── spectral_cayley_v1.json
 │       ├── rank1_matrices.json
 │       └── ...
+│
+├── data/                      # Runtime data storage
+│   ├── wiki_lance/            # LanceDB vector store
+│   ├── traces/                # Execution trace storage
+│   ├── patterns/              # Extracted reasoning patterns
+│   └── generated_templates/   # Cached LLM-generated templates
 │
 └── web/                       # User interface
     └── chat_ui.py             # Gradio chat interface
@@ -237,18 +262,31 @@ sequenceDiagram
 | Component | Role | Key File |
 |-----------|------|----------|
 | **SupervisorAgent** | Problem decomposition, critique, synthesis, repair | `agents/supervisor.py` |
-| **WebSearchAgent** | Real-time web search for current events | `agents/websearch.py` |
+| **WebSearchAgent** | Real-time web search for current events (gated by UI toggle) | `agents/websearch.py` |
 | **SwarmWorkerManager** | Parallel multi-model consensus with cooperative rounds | `agents/swarm_worker.py` |
 | **ResearchWorker** | Code-first Ouroboros loop with sandboxed execution | `agents/worker_researcher.py` |
 | **VerifierAgent** | Independent numeric recomputation | `agents/verifier.py` |
 | **TemplateDistiller** | Keyword-based template selection | `graph/template_distiller.py` |
-| **RAGTemplateDistiller** | RAG-augmented template selection | `graph/template_distiller.py` |
-| **GoTController** | Template DAG execution with RAG nodes | `graph/got_controller.py` |
+| **RAGTemplateDistiller** | RAG-augmented template selection with factual detection + dynamic generation | `graph/template_distiller.py` |
+| **TemplateGenerator** | LLM-based dynamic template creation | `graph/template_generator.py` |
+| **TemplateValidator** | Validates generated templates for correctness | `graph/template_generator.py` |
+| **GoTController** | Template DAG execution with RAG nodes + backtracking | `graph/got_controller.py` |
+| **NodeVerifier** | Type-specific node output verification | `graph/node_verifier.py` |
+| **BacktrackManager** | Intelligent retry with state management | `graph/backtrack_manager.py` |
 | **HybridRetriever** | Semantic + Lexical fusion search (RRF) | `rag/retriever.py` |
+| **RAGEvidencePack** | Structured evidence with formatted citations | `rag/evidence.py` |
 | **CodestralEmbedder** | Dense embeddings via mistralai/codestral-embed-2505 | `rag/embeddings.py` |
 | **WikipediaIndexer** | Document ingestion and indexing | `rag/indexer.py` |
+| **TraceRecorder** | Captures TGR execution traces | `learning/trace_recorder.py` |
+| **TraceStore** | Persists and queries execution traces | `learning/trace_store.py` |
+| **PatternAnalyzer** | Extracts reasoning patterns from traces | `learning/pattern_analyzer.py` |
+| **PromptEnhancer** | Augments prompts with learned patterns | `learning/prompt_enhancer.py` |
+| **DistillationManager** | Coordinates the distillation learning loop | `learning/distillation_manager.py` |
 | **OpenRouterClient** | LLM API wrapper with retries/timeouts | `infra/openrouter/client.py` |
 | **search_web** | DuckDuckGo web search (news + text) | `tools/search.py` |
+| **fetch_url_text** | Safe URL fetching with HTML-to-text extraction | `tools/fetch.py` |
+| **TimelineExtractor** | LLM-based extraction of events, entities, constraints | `tools/timeline.py` |
+| **TimelineSolver** | Deterministic constraint solving for bounded date ranges | `tools/timeline.py` |
 
 ---
 
@@ -361,9 +399,29 @@ Budget Allocation:
 
 ## Real-Time Web Search Agent
 
+### UI Web Toggle
+
+Web search and page fetching are controlled by a **UI toggle** in the Gradio chat interface:
+
+```
+☐ Enable Web (search + fetch page text)
+  "When off, the system will not use DuckDuckGo or fetch URLs."
+```
+
+When **disabled**:
+- No DuckDuckGo searches are performed
+- No URL fetching (including Wikipedia page crawling from RAG URLs)
+- Thinking panel shows: `🔄 Web Disabled: Web search/fetch is disabled (enable in UI to use the internet).`
+- System relies solely on indexed RAG content
+
+When **enabled**:
+- Full web search + page fetching + timeline extraction
+- Wikipedia pages from RAG URLs are crawled for multi-hop reasoning
+- Timeline constraint solving for temporal questions
+
 ### Overview
 
-The **WebSearchAgent** is MAS’s dedicated component for **live web evidence collection** (DuckDuckGo news + web).  
+The **WebSearchAgent** is MAS's dedicated component for **live web evidence collection** (DuckDuckGo news + web).  
 Unlike the static RAG system (which searches pre-indexed documents), WebSearchAgent pulls **fresh evidence** and packages it as a `WebEvidencePack` that is fed into:
 
 - QA/logic worker prompts (Swarm)
@@ -849,6 +907,61 @@ python scripts/index_wikipedia.py \
     --clear --max-docs 1000
 ```
 
+### RAG Quality Detection & Query Expansion
+
+The system includes intelligent detection of low-quality RAG results and automatic query expansion to improve retrieval.
+
+#### Quality Detection
+
+RAG results are evaluated based on score thresholds:
+
+| Quality Level | Max Score Range | Meaning |
+|--------------|-----------------|---------|
+| **good** | ≥ 0.015 | Relevant content found in index |
+| **marginal** | 0.012 - 0.015 | Possibly relevant, may need verification |
+| **poor** | < 0.012 | No relevant content in indexed knowledge base |
+
+```python
+from apps.mas.rag.evidence import detect_rag_quality
+
+quality, max_score = detect_rag_quality(chunks)
+# Returns: ("good" | "marginal" | "poor", float)
+```
+
+#### Query Expansion for Person Names
+
+When initial RAG quality is poor and the query is about a person (e.g., "What is the height of Sonny Cabatu?"), the system automatically tries expanded queries:
+
+```python
+from apps.mas.rag.evidence import expand_person_query
+
+# Original: "What is the height of Sonny Cabatu?"
+expanded = expand_person_query(query)
+# Returns: [
+#   "Sonny Cabatu basketball player",
+#   "Sonny Cabatu PBA roster",
+#   "Sonny Cabatu basketball roster",
+#   "Sonny Cabatu player profile",
+#   "Sonny Cabatu sports",
+#   "Sonny Cabatu biography",
+#   "Sonny Cabatu career",
+#   "Sonny Cabatu"
+# ]
+```
+
+#### Web Search Fallback Suggestion
+
+When RAG quality is poor and web search is disabled, the system emits a warning in the thinking panel and includes a suggestion in the synthesis prompt:
+
+```
+🔄 Rag Quality: RAG quality: poor (max_score=0.0080)
+🔄 Rag Web Suggestion: RAG retrieval quality is low (max_score=0.0080). 
+   The requested information may not be in the indexed knowledge base. 
+   Enable web search for better results.
+```
+
+This helps users understand when they need to enable web search for questions outside the indexed content.
+
 ---
 
 ## Templated Graph Reasoning (TGR)
@@ -1091,6 +1204,387 @@ Step 3: GoT Execution
 
 Step 4: Final Answer
 └── "8"
+```
+
+---
+
+## TGR Pipeline Enhancements
+
+The TGR pipeline has been enhanced with three major features for improved reasoning and self-improvement capabilities:
+
+### Architecture Overview
+
+```mermaid
+flowchart TD
+  subgraph input [Input Layer]
+    Q[User Query]
+  end
+
+  subgraph template_layer [Template Selection with Dynamic Generation]
+    TS[RAGTemplateDistiller]
+    TD{Template Found?}
+    TG[TemplateGenerator]
+    TV[TemplateValidator]
+    TC[TemplateCache]
+  end
+
+  subgraph execution [Execution Layer with Backtracking]
+    GOT[GoTController]
+    NE[NodeExecutor]
+    NV[NodeVerifier]
+    BT[BacktrackManager]
+    SM[StateManager]
+  end
+
+  subgraph learning [Distillation Layer]
+    TR[TraceRecorder]
+    TS2[TraceStore]
+    PA[PatternAnalyzer]
+    PE[PromptEnhancer]
+  end
+
+  Q --> TS
+  TS --> TD
+  TD -->|yes| GOT
+  TD -->|no| TG
+  TG --> TV
+  TV -->|valid| TC
+  TV -->|invalid| TG
+  TC --> GOT
+  
+  GOT --> NE
+  NE --> NV
+  NV -->|fail| BT
+  BT --> SM
+  SM --> NE
+  NV -->|pass| TR
+  
+  TR --> TS2
+  TS2 --> PA
+  PA --> PE
+  PE -.->|enhance| TS
+  PE -.->|enhance| TG
+```
+
+### Feature 1: Dynamic Template Generation
+
+When no existing template matches a problem (score < `MIN_TEMPLATE_SCORE`), the system can dynamically generate a custom template using an LLM.
+
+#### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `TemplateGenerator` | `graph/template_generator.py` | LLM-based template generation |
+| `TemplateValidator` | `graph/template_generator.py` | Validates generated templates |
+| `GeneratedTemplateCache` | `graph/template_generator.py` | Persists successful templates |
+
+#### Generation Flow
+
+```python
+class TemplateGenerator:
+    def generate(self, problem: str, rag_context: List[str]) -> GenerationResult:
+        """
+        1. Analyze problem structure (entities, relationships, expected output)
+        2. Generate node graph with appropriate types/roles
+        3. Create knowledge seeds from RAG context
+        4. Validate and cache if successful
+        """
+```
+
+#### Validation Rules
+
+The `TemplateValidator` ensures generated templates are:
+- **Acyclic**: Graph can be topologically sorted
+- **Valid node types**: definition, enumeration, calculation, aggregation, verification, retrieval
+- **Valid roles**: logic, math, research, verifier, rag, qa
+- **Complete**: All nodes have instructions, all edges reference valid nodes
+- **Reasonable size**: 2-10 nodes
+
+#### Integration
+
+Enabled via `RAGTemplateDistiller`:
+
+```python
+distiller = RAGTemplateDistiller(
+    templates_dir="apps/mas/configs/templates",
+    retriever=retriever,
+    template_generator=generator,  # NEW
+    enable_dynamic_generation=True,  # NEW
+)
+
+template, score, context = distiller.select_with_rag(problem)
+# If no template matches, automatically generates one
+```
+
+### Feature 2: Backtracking System
+
+Intelligent retry mechanism that re-executes reasoning nodes when verification fails.
+
+#### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `NodeVerifier` | `graph/node_verifier.py` | Type-specific output validation |
+| `BacktrackManager` | `graph/backtrack_manager.py` | Decides when/how to retry |
+| `StateManager` | `graph/backtrack_manager.py` | Checkpointing and rollback |
+
+#### Node Verification
+
+The `NodeVerifier` validates outputs based on node type:
+
+```python
+class NodeVerifier:
+    def verify_node_output(
+        self,
+        node_id: str,
+        node_type: str,  # definition, enumeration, calculation, etc.
+        role: str,
+        output: str,
+        instruction: str,
+    ) -> VerificationResult:
+        """
+        Returns VerificationResult(passed, confidence, issues, suggested_fix)
+        
+        Checks based on node type:
+        - definition: output defines key concepts
+        - enumeration: output contains list structure
+        - calculation: output contains numeric result or ####
+        - aggregation: output synthesizes prior results
+        - verification: output confirms/corrects numeric answer
+        """
+```
+
+#### Retry Strategies
+
+| Strategy | When Applied | Action |
+|----------|--------------|--------|
+| `retry_same` | Transient failure (timeout, API error) | Re-execute with same params |
+| `adjust_params` | Calculation error | Lower temperature, add constraints |
+| `alternative_approach` | Logic error | Switch node role (e.g., logic → research) |
+| `expand_context` | Insufficient info | Add more RAG context |
+
+#### Backtracking Flow
+
+```mermaid
+flowchart TD
+  START[Start Node Execution]
+  EXEC[Execute Node]
+  VERIFY[NodeVerifier.verify_node_output]
+  PASS{Passed?}
+  SAVE[StateManager.save_checkpoint]
+  NEXT[Next Node]
+  
+  BT_DECIDE[BacktrackManager.decide_backtrack]
+  BT_CHECK{Can Backtrack?}
+  RESTORE[StateManager.restore_checkpoint]
+  ADJUST[Adjust Strategy]
+  FAIL[Mark Node Failed]
+  
+  START --> EXEC
+  EXEC --> VERIFY
+  VERIFY --> PASS
+  PASS -->|yes| SAVE
+  SAVE --> NEXT
+  PASS -->|no| BT_DECIDE
+  BT_DECIDE --> BT_CHECK
+  BT_CHECK -->|yes, retries left| RESTORE
+  RESTORE --> ADJUST
+  ADJUST --> EXEC
+  BT_CHECK -->|no, max retries| FAIL
+  FAIL --> NEXT
+```
+
+#### Integration
+
+Enable backtracking in `GoTController`:
+
+```python
+got = GoTController(
+    problem=problem,
+    template=template,
+    swarm=swarm,
+    researcher=researcher,
+    verifier=verifier,
+    enable_backtracking=True,  # NEW
+    max_backtrack_depth=3,     # NEW
+    max_retries_per_node=2,    # NEW
+)
+
+result = got.run()
+# Automatically retries failed nodes with intelligent strategies
+```
+
+### Feature 3: Distillation Loop
+
+Learn from successful TGR execution traces to improve future performance through prompt enhancement and pattern extraction.
+
+#### Components
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| `TraceRecorder` | `learning/trace_recorder.py` | Captures execution traces |
+| `TraceStore` | `learning/trace_store.py` | Persists traces to disk |
+| `PatternAnalyzer` | `learning/pattern_analyzer.py` | Extracts reasoning patterns |
+| `PromptEnhancer` | `learning/prompt_enhancer.py` | Augments prompts with patterns |
+| `DistillationManager` | `learning/distillation_manager.py` | Coordinates the loop |
+
+#### Trace Recording
+
+```python
+@dataclass
+class ExecutionTrace:
+    trace_id: str
+    timestamp: datetime
+    problem: str
+    template_id: str
+    nodes: List[NodeTrace]  # id, type, role, input, output, duration, success
+    final_answer: str
+    verified: bool
+    verification_method: str  # "archetype", "verifier", "benchmark", "none"
+    metadata: Dict[str, Any]  # RAG context, backtrack count, etc.
+```
+
+The `GoTController` automatically records traces when `trace_store` is provided:
+
+```python
+got = GoTController(
+    ...,
+    trace_store=trace_store,  # NEW
+    record_traces=True,       # NEW (default)
+)
+```
+
+#### Pattern Analysis
+
+The `PatternAnalyzer` extracts:
+
+1. **Success Patterns**: Node sequences and key phrases from verified traces
+2. **Failure Patterns**: Common failure modes for targeted improvement
+
+```python
+@dataclass
+class ReasoningPattern:
+    pattern_id: str
+    template_id: str
+    node_sequence: List[str]  # Ordered node types that led to success
+    key_phrases: List[str]    # Common phrases in successful outputs
+    context_requirements: List[str]  # What context was needed
+    success_rate: float
+    sample_count: int
+```
+
+#### Prompt Enhancement
+
+The `PromptEnhancer` uses patterns to improve prompts:
+
+```python
+class PromptEnhancer:
+    def enhance_instruction(
+        self,
+        instruction: str,
+        node_type: str,
+        node_role: str,
+        template_id: str,
+        traces: List[ExecutionTrace],
+    ) -> EnhancedInstruction:
+        """
+        Augments instructions with:
+        - Key phrases from successful traces
+        - Few-shot examples
+        - Guardrails against common failures
+        """
+```
+
+#### Distillation Manager
+
+The `DistillationManager` coordinates the complete loop:
+
+```python
+from apps.mas.learning import get_distillation_manager
+
+# Get or create the global manager
+manager = get_distillation_manager()
+
+# Record a trace
+manager.record_trace(result, problem, verified=True)
+
+# Periodic analysis (triggered automatically after N traces)
+stats = manager.run_analysis()
+
+# Enhance instructions using learned patterns
+enhanced = manager.enhance_instruction(
+    instruction="Define the group structure",
+    node_type="definition",
+    node_role="logic",
+    template_id="spectral_cayley_v1",
+)
+```
+
+#### Learning Strategy
+
+| Phase | Trigger | Action |
+|-------|---------|--------|
+| **Capture** | Every TGR execution | Record trace with verification status |
+| **Filter** | On save | Only persist verified, high-quality traces |
+| **Analyze** | Every 100 new traces | Extract patterns, identify failures |
+| **Enhance** | On GoT init | Inject few-shot examples, enhanced instructions |
+| **Evaluate** | Continuous | Track success rate delta after enhancements |
+
+### Configuration
+
+All features are configured in `apps/mas/configs/learning.yaml`:
+
+```yaml
+# Dynamic Template Generation
+dynamic_templates:
+  enabled: true
+  max_generation_attempts: 2
+  cache_path: "apps/mas/data/generated_templates"
+
+# Backtracking
+backtracking:
+  enabled: false  # Enable for complex problems
+  max_depth: 3
+  max_retries_per_node: 2
+  strategies:
+    - retry_same
+    - adjust_params
+    - alternative_approach
+    - expand_context
+
+# Distillation Loop
+distillation:
+  enabled: true
+  trace_storage_path: "apps/mas/data/traces"
+  patterns_storage_path: "apps/mas/data/patterns"
+  min_traces_for_analysis: 50
+  analysis_interval: 100
+  few_shot_examples_per_node: 2
+```
+
+### File Structure
+
+```text
+apps/mas/
+├── graph/
+│   ├── template_generator.py    # Dynamic template generation
+│   ├── node_verifier.py         # Node output verification
+│   ├── backtrack_manager.py     # Backtracking + state management
+│   ├── got_controller.py        # Enhanced with backtracking + tracing
+│   └── template_distiller.py    # Enhanced with dynamic generation
+├── learning/                    # NEW: Distillation module
+│   ├── __init__.py
+│   ├── trace_recorder.py        # Execution trace capture
+│   ├── trace_store.py           # Trace persistence
+│   ├── pattern_analyzer.py      # Pattern extraction
+│   ├── prompt_enhancer.py       # Prompt augmentation
+│   └── distillation_manager.py  # Coordination
+├── data/
+│   ├── generated_templates/     # Cached generated templates
+│   ├── traces/                  # Execution trace storage
+│   └── patterns/                # Extracted patterns
+└── configs/
+    └── learning.yaml            # Feature configuration
 ```
 
 ---
@@ -1403,8 +1897,16 @@ python -m apps.mas.benchmarks.hotpotqa
 | `agents/websearch.py` | Web evidence + deterministic extraction | ~900 |
 | `agents/swarm_worker.py` | Multi-model parallel consensus | ~350 |
 | `agents/worker_researcher.py` | Ouroboros code loop | ~400 |
-| `graph/got_controller.py` | TGR DAG execution with RAG | ~375 |
-| `graph/template_distiller.py` | Template selection (keyword + RAG) | ~335 |
+| `graph/got_controller.py` | TGR DAG execution with RAG + backtracking | ~550 |
+| `graph/template_distiller.py` | Template selection (keyword + RAG + dynamic gen) | ~450 |
+| `graph/template_generator.py` | Dynamic template generation via LLM | ~400 |
+| `graph/node_verifier.py` | Type-specific node output verification | ~350 |
+| `graph/backtrack_manager.py` | Intelligent retry with state management | ~400 |
+| `learning/trace_recorder.py` | Execution trace capture | ~200 |
+| `learning/trace_store.py` | Trace persistence and querying | ~250 |
+| `learning/pattern_analyzer.py` | Pattern extraction from traces | ~300 |
+| `learning/prompt_enhancer.py` | Prompt augmentation with patterns | ~250 |
+| `learning/distillation_manager.py` | Coordination of learning loop | ~300 |
 | `rag/retriever.py` | Hybrid fusion search | ~470 |
 | `rag/embeddings.py` | Codestral embedder | ~230 |
 | `rag/indexer.py` | Wikipedia ingestion | ~360 |
@@ -1436,27 +1938,54 @@ plan_graph.py
 ## Known Limitations
 
 1. **Swarm Consensus**: Can reinforce shared errors across models
-2. **RAG Coverage**: Limited to indexed Wikipedia subset
-3. **TGR Templates**: Keyword matching may miss edge cases
+2. **RAG Coverage**: Limited to indexed Wikipedia subset (quality detection now warns when content not found)
+3. **TGR Templates**: Keyword matching may miss edge cases (factual question detection helps prevent misrouting)
 4. **Code Execution**: Sandbox has 60s timeout, may fail for complex computations
 5. **Latent Module**: Experimental, not wired into main pipeline
 6. **Question Detection**: Heuristic-based, may misclassify ambiguous questions
 7. **Web Search**: Dependent on DuckDuckGo availability; may get rate-limited
 8. **Current Events Detection**: Pattern-based, may miss some current-events questions
+9. **Query Expansion**: Currently limited to person name patterns; other entity types may not expand
 
 ---
 
 ## Future Enhancements
 
-1. **Dynamic Template Generation**: LLM-generated templates for novel problems
-2. **Backtracking**: Re-execute nodes on verification failure
-3. **Distillation Loop**: Learn from successful TGR traces
+1. ~~**Dynamic Template Generation**: LLM-generated templates for novel problems~~ ✓ Implemented
+2. ~~**Backtracking**: Re-execute nodes on verification failure~~ ✓ Implemented
+3. ~~**Distillation Loop**: Learn from successful TGR traces~~ ✓ Implemented
 4. **Expanded RAG**: Full Wikipedia, arXiv, or custom knowledge bases
 5. **Multi-Modal**: Image/diagram understanding for visual problems
 6. **Latent Communication**: Inter-agent hidden state sharing
-7. **Enhanced Web Search**: Multiple search providers, caching, smart query rewriting
-8. **Hybrid RAG + Web**: Combine static RAG with live web search for comprehensive answers
+7. ~~**Enhanced Web Search**: Multiple search providers, caching, smart query rewriting~~ ✓ Partially implemented (page fetching, timeline extraction)
+8. ~~**Hybrid RAG + Web**: Combine static RAG with live web search for comprehensive answers~~ ✓ Implemented (RAG URL crawling + timeline reasoning)
+
+### Recently Implemented (December 2025)
+
+#### TGR Pipeline Enhancements
+- **Dynamic Template Generation**: LLM-based creation of reasoning templates when no existing template matches
+- **Template Validation**: Automatic validation of generated templates (acyclic graph, valid node types)
+- **Generated Template Caching**: Successful templates persisted to disk for reuse
+- **Node Verification**: Type-specific output validation for calculation, verification, aggregation nodes
+- **Intelligent Backtracking**: Retry strategies (retry_same, adjust_params, alternative_approach, expand_context)
+- **State Management**: Checkpointing and rollback for efficient re-execution
+- **Trace Recording**: Automatic capture of execution traces with timing and context
+- **Pattern Analysis**: Extraction of successful reasoning patterns and failure modes
+- **Prompt Enhancement**: Few-shot examples and guardrails from learned patterns
+- **Distillation Manager**: Coordinated self-improvement loop with periodic analysis
+
+#### RAG & Web Improvements
+- **UI Web Toggle**: Checkbox to enable/disable web search and page fetching
+- **RAG Quality Detection**: Automatic detection of low-quality retrieval results
+- **Query Expansion**: Expanded queries for person names when RAG quality is poor
+- **Web Fallback Suggestion**: Warning when RAG quality is low and web is disabled
+- **Wikipedia Page Crawling**: Fetch full page content from RAG-returned URLs
+- **Timeline Extraction**: LLM-based extraction of events, entities, and temporal constraints
+- **Timeline Solving**: Deterministic constraint solving for bounded date ranges
+- **Factual Question Detection**: Prevents factual/QA questions from being routed to math templates
+- **Minimum Template Score**: Threshold (score ≥ 5) to avoid false-positive template selection
+- **Seed Chunk Reuse**: Uses original problem for RAG queries to avoid malformed subtask instructions
 
 ---
 
-*Last updated: December 2025*
+*Last updated: December 14, 2025 — TGR Pipeline Enhancements (Dynamic Templates, Backtracking, Distillation Loop)*

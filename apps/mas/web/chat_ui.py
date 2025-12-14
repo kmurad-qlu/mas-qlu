@@ -29,7 +29,8 @@ def build_compiled_app(config_path: str | None = None) -> Any:
 def answer_question_with_thinking(
     question: str, 
     config_path: str, 
-    timeout_s: float = 300.0
+    timeout_s: float = 300.0,
+    web_enabled: bool = False,
 ) -> Tuple[str, List[Tuple[str, str]]]:
     """
     Invoke with thinking log and return (answer, thinking_log).
@@ -43,7 +44,8 @@ def answer_question_with_thinking(
         problem=question, 
         config_path=config_path, 
         timeout_s=timeout_s,
-        thinking_callback=thinking_callback
+        thinking_callback=thinking_callback,
+        web_enabled=web_enabled,
     )
     ans = getattr(out, "final_answer", "") or ""
     return str(ans).strip(), thinking_updates
@@ -76,7 +78,12 @@ def format_thinking_log(thinking_log: List[Tuple[str, str]]) -> str:
         elif "model" in stage:
             emoji = "🤖"
         
-        lines.append(f"{emoji} **{stage_display}**: {content}")
+        # For multi-line payloads (e.g., RAG chunk lists, timeline reasoning), render content on a new line.
+        c = "" if content is None else str(content)
+        if "\n" in c or stage.startswith("rag_") or stage == "rag_chunks" or stage.startswith("timeline_"):
+            lines.append(f"{emoji} **{stage_display}**:\n{c}")
+        else:
+            lines.append(f"{emoji} **{stage_display}**: {c}")
     
     return "\n\n".join(lines)
 
@@ -143,6 +150,12 @@ def make_ui(app: Any, config_path: str) -> gr.Blocks:
                 
                 with gr.Row():
                     clear_btn = gr.Button("Clear Chat", size="sm")
+                    web_toggle = gr.Checkbox(
+                        value=False,
+                        label="Enable Web (search + fetch page text)",
+                        info="When off, the system will not use DuckDuckGo or fetch URLs.",
+                        scale=2,
+                    )
                     timeout_slider = gr.Slider(
                         minimum=60, 
                         maximum=600, 
@@ -191,7 +204,7 @@ def make_ui(app: Any, config_path: str) -> gr.Blocks:
 - ❌ Errors (if any)
                     """)
         
-        def respond(message: str, history: list, timeout: float):
+        def respond(message: str, history: list, timeout: float, web_enabled: bool):
             if not message.strip():
                 return history, "*Please enter a question*"
             
@@ -205,7 +218,8 @@ def make_ui(app: Any, config_path: str) -> gr.Blocks:
             answer, thinking_log = answer_question_with_thinking(
                 message, 
                 config_path=config_path, 
-                timeout_s=timeout
+                timeout_s=timeout,
+                web_enabled=web_enabled,
             )
             
             # Update the last assistant message with the answer
@@ -219,7 +233,7 @@ def make_ui(app: Any, config_path: str) -> gr.Blocks:
         
         submit_btn.click(
             respond,
-            inputs=[msg, chatbot, timeout_slider],
+            inputs=[msg, chatbot, timeout_slider, web_toggle],
             outputs=[chatbot, thinking_output],
         ).then(
             lambda: "",
@@ -228,7 +242,7 @@ def make_ui(app: Any, config_path: str) -> gr.Blocks:
         
         msg.submit(
             respond,
-            inputs=[msg, chatbot, timeout_slider],
+            inputs=[msg, chatbot, timeout_slider, web_toggle],
             outputs=[chatbot, thinking_output],
         ).then(
             lambda: "",

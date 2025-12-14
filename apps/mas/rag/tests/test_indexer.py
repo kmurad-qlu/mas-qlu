@@ -10,6 +10,9 @@ import tempfile
 import pytest
 import numpy as np
 
+# These tests require LanceDB.
+pytest.importorskip("lancedb")
+
 
 class MockEmbedder:
     """Mock embedder for testing without API calls."""
@@ -68,6 +71,17 @@ class TestChunker:
         
         assert len(chunks) == 1
         assert chunks[0] == short_text
+
+    def test_chunk_text_token_aware_params(self):
+        """Verify token-aware params produce reasonable chunking without errors."""
+        from apps.mas.rag.chunker import chunk_text
+        
+        original = "Token aware chunking. " * 400  # reasonably long
+        chunks = chunk_text(original, chunk_size_tokens=80, overlap_tokens=10)
+        
+        assert len(chunks) > 1
+        # Rough check: 80 tokens ~ 320 chars; allow some flexibility due to boundary adjustment
+        assert all(len(c) <= 500 for c in chunks)
     
     def test_chunk_text_empty(self):
         """Verify empty text returns empty list."""
