@@ -1,0 +1,65 @@
+# TGR Pipeline Enhancement Configuration
+# Controls Dynamic Templates, Backtracking, and Distillation features
+
+# Dynamic Template Generation
+dynamic_templates:
+  enabled: true
+  max_generation_attempts: 2
+  cache_successful: true
+  cache_path: "apps/mas/data/generated_templates"
+  # Model for template generation (uses main model if not specified)
+  model: null
+
+# Backtracking Configuration
+backtracking:
+  enabled: false  # Disabled by default, enable for complex problems
+  max_depth: 3  # Maximum backtrack depth
+  max_retries_per_node: 2  # Maximum retries for any single node
+  strategies:
+    - retry_same
+    - adjust_params
+    - alternative_approach
+    - expand_context
+  # Node types to verify (others skip verification)
+  verify_node_types:
+    - calculation
+    - verification
+    - aggregation
+
+# Distillation Loop Configuration
+distillation:
+  enabled: true
+  trace_storage_path: "apps/mas/data/traces"
+  patterns_storage_path: "apps/mas/data/patterns"
+  min_traces_for_analysis: 50
+  analysis_interval: 100  # Traces between analyses
+  few_shot_examples_per_node: 2
+  max_guardrails: 3
+  # Auto-prune old traces to manage storage
+  auto_prune:
+    enabled: true
+    keep_verified: 1000
+    keep_unverified: 100
+
+# Node Verification Settings
+node_verification:
+  min_output_lengths:
+    definition: 50
+    enumeration: 30
+    calculation: 10
+    aggregation: 40
+    verification: 5
+    retrieval: 20
+  pass_threshold: 0.5
+
+# Trace Recording Settings
+trace_recording:
+  enabled: true
+  high_quality_threshold:
+    min_success_rate: 0.8
+    max_duration_ms: 300000  # 5 minutes
+  truncation:
+    instruction: 500
+    context: 1000
+    output: 2000
+

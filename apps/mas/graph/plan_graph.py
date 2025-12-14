@@ -19,6 +19,15 @@ from ..agents.verifier import VerifierAgent
 from ..agents.swarm_worker import SwarmWorkerManager
 from .template_distiller import TemplateDistiller
 from .got_controller import GoTController
+from ..rag.evidence import (
+    build_rag_evidence_pack, 
+    RAGEvidencePack,
+    detect_rag_quality,
+    expand_person_query,
+    should_suggest_web_fallback,
+)
+from ..tools.timeline import extract_timeline, solve_timeline
+from ..tools.fetch import fetch_url_text, select_relevant_passages, FetchResult
 import re
 import json
 import time
@@ -66,6 +75,62 @@ def _emit_thinking(stage: str, content: str) -> None:
     _thinking_log.append((stage, content))
     if _thinking_callback:
         _thinking_callback(stage, content)
+
+
+def _retrieve_rag_evidence_for_subtask(
+    *,
+    retriever: Any,
+    subtask: SubTask,
+    original_problem: str,
+    rag_top_k: int,
+    time_left: Callable[[], float],
+    emit_thinking: Callable[[str, str], None],
+    seed_chunks: Optional[List[Any]] = None,
+) -> Optional[RAGEvidencePack]:
+    """
+    Standard-path RAG: retrieve evidence for QA/Logic subtasks.
+    
+    Uses the original_problem for the RAG query (not the subtask instruction,
+    which may be malformed with JSON/code formatting).
+    
+    If seed_chunks is provided, reuse those instead of re-querying to avoid
+    duplicate work and to preserve high-scoring initial results.
+    
+    Kept as a module-level helper to allow unit testing.
+    """
+    if not retriever:
+        return None
+    if subtask.role not in ("qa", "logic"):
+        return None
+    # Avoid burning budget on retrieval when low on time.
+    if time_left() < 12:
+        emit_thinking("rag_skip", f"Skipping RAG for subtask '{subtask.id}' (low time budget)")
+        return None
+    
+    # Use original problem as query, NOT the subtask instruction (which may be JSON-formatted)
+    q = (original_problem or "").strip()
+    if not q:
+        return None
+    
+    try:
+        # Reuse seed chunks if available (already queried with high scores)
+        if seed_chunks:
+            chunks = seed_chunks[:rag_top_k]
+            emit_thinking(f"rag_{subtask.id}_reuse", f"Reusing {len(chunks)} seed chunks (no re-query)")
+        else:
+            chunks = retriever.fusion_search(q, k=rag_top_k)
+        
+        pack = build_rag_evidence_pack(
+            query=q,
+            method="fusion",
+            top_k=rag_top_k,
+            chunks=chunks,
+            emit=lambda stage, content: emit_thinking(f"rag_{subtask.id}_{stage}", content),
+        )
+        return pack
+    except Exception as e:
+        emit_thinking("rag_error", f"RAG retrieval failed for subtask '{subtask.id}': {str(e)[:200]}")
+        return None
 
 
 def _run_with_timeout(func: Callable, timeout_seconds: float, default_value=None):
@@ -513,7 +578,8 @@ def solve_with_budget(
     problem: str, 
     config_path: str, 
     timeout_s: float = 300.0,
-    thinking_callback: Optional[Callable[[str, str], None]] = None
+    thinking_callback: Optional[Callable[[str, str], None]] = None,
+    web_enabled: bool = False,
 ) -> GraphState:
     """
     Best-effort orchestration that respects an overall time budget.
@@ -644,7 +710,7 @@ def solve_with_budget(
                 _emit_thinking("rag_skip", f"RAG database not found at {rag_db_path}, skipping RAG")
         except Exception as e:
             _emit_thinking("rag_init_error", f"Failed to initialize RAG: {str(e)[:150]}")
-    
+
     # Wire up thinking callbacks
     supervisor.set_thinking_callback(_emit_thinking)
     swarm.set_thinking_callback(_emit_thinking)
@@ -657,6 +723,91 @@ def solve_with_budget(
     def elapsed() -> float:
         return time.perf_counter() - t0
 
+    def _is_temporal_question(q: str) -> bool:
+        t = (q or "").strip().lower()
+        if not t:
+            return False
+        if any(k in t for k in ["when", "what date", "date of", "sent home", "eliminated", "released on", "between", "after", "before"]):
+            return True
+        return False
+
+    # Retrieve seed RAG chunks using the original problem (high-scoring results for reuse)
+    # This avoids malformed queries later when subtask instructions contain JSON/code.
+    seed_rag_chunks: List[Any] = []
+    rag_quality_warning: str = ""  # Warning to include if RAG quality is low
+    if retriever and time_left() > 15:
+        try:
+            seed_rag_chunks = retriever.fusion_search(problem, k=rag_top_k)
+            _emit_thinking("rag_seed_retrieved", f"Retrieved {len(seed_rag_chunks)} seed chunks using original problem")
+            
+            # Check RAG quality and try query expansion if poor
+            quality, max_score = detect_rag_quality(seed_rag_chunks)
+            _emit_thinking("rag_quality", f"RAG quality: {quality} (max_score={max_score:.4f})")
+            
+            if quality == "poor" and time_left() > 10:
+                # Try query expansion for person names / entities
+                expanded_queries = expand_person_query(problem)
+                if expanded_queries:
+                    _emit_thinking("rag_expand_start", f"Trying {len(expanded_queries)} expanded queries due to low quality")
+                    for exp_q in expanded_queries[:3]:  # Try up to 3 expansions
+                        try:
+                            exp_chunks = retriever.fusion_search(exp_q, k=rag_top_k)
+                            exp_quality, exp_max = detect_rag_quality(exp_chunks)
+                            if exp_quality in ("good", "marginal") and exp_max > max_score:
+                                _emit_thinking("rag_expand_success", f"Expanded query '{exp_q[:60]}...' improved quality to {exp_quality} (score={exp_max:.4f})")
+                                seed_rag_chunks = exp_chunks
+                                quality, max_score = exp_quality, exp_max
+                                break
+                        except Exception:
+                            pass
+            
+            # Check if we should suggest web fallback
+            should_suggest, suggestion_msg = should_suggest_web_fallback(seed_rag_chunks, web_enabled)
+            if should_suggest:
+                _emit_thinking("rag_web_suggestion", suggestion_msg)
+                rag_quality_warning = suggestion_msg
+                
+        except Exception as e:
+            _emit_thinking("rag_seed_error", f"Failed to retrieve seed chunks: {str(e)[:150]}")
+
+    # Optional: if web is enabled and RAG returns Wikipedia URLs, fetch those pages too.
+    rag_url_fetch_pages: List[Dict[str, Any]] = []
+    rag_url_fetch_blocks: List[str] = []
+    rag_url_fetch_combined = ""
+    _fetch_cache: Dict[str, FetchResult] = {}
+    _fetched_rag_urls: set[str] = set()
+    if web_enabled and seed_rag_chunks and time_left() > 20:
+        try:
+            # Light prefetch to improve multi-hop temporal reasoning from the canonical page.
+            # Use top-scoring seed chunks (already retrieved above).
+            wiki_urls: List[str] = []
+            for ch in seed_rag_chunks[:3]:
+                u = (ch.url or "").strip()
+                if not u:
+                    continue
+                if "wikipedia.org/wiki/" in u and u not in wiki_urls:
+                    wiki_urls.append(u)
+            for u in wiki_urls[:2]:
+                if u in _fetched_rag_urls:
+                    continue
+                _emit_thinking("rag_url_fetch_start", f"Fetching Wikipedia page from RAG URL: {u}")
+                fr = fetch_url_text(u, timeout_s=10.0, max_bytes=2_000_000, cache=_fetch_cache)
+                if fr.error or not fr.text:
+                    _emit_thinking("rag_url_fetch_error", f"Fetch failed: {u} ({fr.error})")
+                    rag_url_fetch_pages.append({"url": u, "error": fr.error or "empty"})
+                    continue
+                snippet = select_relevant_passages(fr.text, problem, max_chars=4500)
+                rag_url_fetch_pages.append({"url": u, "status_code": fr.status_code, "snippet_chars": len(snippet)})
+                if snippet:
+                    _fetched_rag_urls.add(u)
+                    rag_url_fetch_blocks.append(f"=== RAG URL Fetched: {u} ===\n{snippet}")
+                    _emit_thinking("rag_url_fetch_ok", f"Fetched {u} snippet_chars={len(snippet)} status={fr.status_code}")
+            rag_url_fetch_combined = ("\n\n".join(rag_url_fetch_blocks)).strip()
+            if rag_url_fetch_combined:
+                _emit_thinking("rag_url_fetch_ready", f"RAG URL fetched evidence chars={len(rag_url_fetch_combined)}")
+        except Exception as e:
+            _emit_thinking("rag_url_fetch_error", f"RAG URL prefetch failed: {str(e)[:200]}")
+
     # Per-operation timeout (use fraction of total budget)
     # Increased to 150s max for complex reasoning tasks
     per_op_timeout = min(timeout_s / 3, 150.0)  # Max 150s per operation
@@ -668,6 +819,8 @@ def solve_with_budget(
     template_spec = None
     template_score = 0
     rag_context = []
+    # RAG evidence captured from standard (non-TGR) path for UI + synthesis.
+    rag_evidence_packs: List[RAGEvidencePack] = []
     if tgr_enabled and time_left() > 0:
         try:
             # Use RAG-enhanced distiller if retriever is available
@@ -742,7 +895,9 @@ def solve_with_budget(
     # Build Web Evidence once per problem (used as an evidence layer for QA/logic tasks)
     web_evidence: WebEvidencePack | None = None
     web_evidence_for_context = ""
-    if time_left() > 15 and not _looks_single_number_question(problem, None):
+    timeline_context = ""
+    timeline_citations = ""
+    if web_enabled and time_left() > 15 and not _looks_single_number_question(problem, None):
         try:
             websearch_agent = WebSearchAgent(
                 client=client,
@@ -766,9 +921,32 @@ def solve_with_budget(
                     "web_evidence_ready",
                     f"Web evidence collected: queries={len(web_evidence.queries)}, chars={len(web_evidence.combined_results)}"
                 )
+
+            if web_evidence and web_evidence.combined_results and _is_temporal_question(problem) and time_left() > 20:
+                _emit_thinking("timeline_start", "Attempting timeline inference from web evidence")
+                timeline_input = web_evidence.combined_results
+                if rag_url_fetch_combined:
+                    timeline_input = (timeline_input + "\n\n" + "=== RAG URL Page Evidence ===\n" + rag_url_fetch_combined).strip()
+                ext = extract_timeline(
+                    client=client,
+                    model=supervisor_model,
+                    question=problem,
+                    evidence_text=timeline_input,
+                    emit=_emit_thinking,
+                )
+                if ext:
+                    ans = solve_timeline(ext)
+                    timeline_context = f"Timeline inference: {ans.format_answer()}\nRationale: {ans.rationale}"
+                    # Use [W#] labels to avoid colliding with RAG [R#]
+                    timeline_citations = ans.format_citations(prefix="W")
+                    _emit_thinking("timeline_answer", timeline_context)
+                    if timeline_citations:
+                        _emit_thinking("timeline_citations", timeline_citations)
         except Exception as e:
             _emit_thinking("web_evidence_error", f"Web evidence collection failed: {str(e)[:150]}")
             web_evidence = None
+    elif not web_enabled:
+        _emit_thinking("web_disabled", "Web search/fetch is disabled (enable in UI to use the internet).")
 
     # Dispatch workers using swarm with MULTI-HOP REASONING
     # Results are keyed by subtask ID for dependency resolution
@@ -838,6 +1016,59 @@ def solve_with_budget(
             # Web Evidence layer: attach to QA/logic tasks by default
             if web_evidence_for_context and st.role in ("qa", "logic"):
                 context_parts.append(f"[Web Evidence (search results)]:\n{web_evidence_for_context}")
+
+            # If we fetched Wikipedia pages based on RAG URLs, attach that too (web-enabled only).
+            if web_enabled and rag_url_fetch_combined and st.role in ("qa", "logic"):
+                context_parts.append(f"[Fetched Page Evidence (from RAG URLs)]:\n{rag_url_fetch_combined[:4500]}")
+
+            # Timeline inference layer (temporal constraints/range), if available
+            if timeline_context and st.role in ("qa", "logic"):
+                ctx = timeline_context
+                if timeline_citations:
+                    ctx += "\nCitations:\n" + timeline_citations
+                context_parts.append(f"[Timeline Inference]:\n{ctx}")
+
+            # RAG Evidence layer: attach to QA/logic tasks by default (standard path)
+            # Use original problem for query and reuse seed chunks to avoid malformed queries
+            rag_pack = _retrieve_rag_evidence_for_subtask(
+                retriever=retriever,
+                subtask=st,
+                original_problem=problem,
+                rag_top_k=rag_top_k,
+                time_left=time_left,
+                emit_thinking=_emit_thinking,
+                seed_chunks=seed_rag_chunks if seed_rag_chunks else None,
+            )
+            if rag_pack:
+                rag_evidence_packs.append(rag_pack)
+                rag_ctx = rag_pack.format_context(max_length=3500, include_titles=True)
+                if rag_ctx:
+                    context_parts.append(f"[RAG Retrieved Evidence]:\n{rag_ctx}")
+
+                # If RAG returns Wikipedia URLs, crawl them (web enabled) and add extracts.
+                if web_enabled and time_left() > 15:
+                    try:
+                        wiki_urls: List[str] = []
+                        for ch in rag_pack.chunks[:5]:
+                            u = (ch.url or "").strip()
+                            if not u:
+                                continue
+                            if "wikipedia.org/wiki/" in u and u not in _fetched_rag_urls and u not in wiki_urls:
+                                wiki_urls.append(u)
+                        for u in wiki_urls[:1]:  # cap per subtask to avoid fetch storms
+                            _emit_thinking("rag_url_fetch_start", f"Fetching Wikipedia page from RAG URL: {u}")
+                            fr = fetch_url_text(u, timeout_s=10.0, max_bytes=2_000_000, cache=_fetch_cache)
+                            if fr.error or not fr.text:
+                                _emit_thinking("rag_url_fetch_error", f"Fetch failed: {u} ({fr.error})")
+                                continue
+                            snippet = select_relevant_passages(fr.text, st.instruction or problem, max_chars=4500)
+                            if snippet:
+                                _fetched_rag_urls.add(u)
+                                rag_url_fetch_blocks.append(f"=== RAG URL Fetched: {u} ===\n{snippet}")
+                                rag_url_fetch_combined = ("\n\n".join(rag_url_fetch_blocks)).strip()
+                                _emit_thinking("rag_url_fetch_ok", f"Fetched {u} snippet_chars={len(snippet)} status={fr.status_code}")
+                    except Exception as e:
+                        _emit_thinking("rag_url_fetch_error", f"RAG URL fetch failed: {str(e)[:150]}")
 
             context = "\n".join(context_parts) if context_parts else ""
             
@@ -969,6 +1200,24 @@ def solve_with_budget(
     if pending_subtasks:
         _emit_thinking("dispatch_incomplete", f"{len(pending_subtasks)} subtasks could not be executed")
 
+    # If temporal and we fetched RAG URLs later during dispatch, attempt timeline inference now (best-effort).
+    if web_enabled and (not timeline_context) and rag_url_fetch_combined and _is_temporal_question(problem) and time_left() > 20:
+        _emit_thinking("timeline_start", "Attempting timeline inference from fetched RAG URL pages")
+        ext = extract_timeline(
+            client=client,
+            model=supervisor_model,
+            question=problem,
+            evidence_text=rag_url_fetch_combined,
+            emit=_emit_thinking,
+        )
+        if ext:
+            ans = solve_timeline(ext)
+            timeline_context = f"Timeline inference: {ans.format_answer()}\nRationale: {ans.rationale}"
+            timeline_citations = ans.format_citations(prefix="W")
+            _emit_thinking("timeline_answer", timeline_context)
+            if timeline_citations:
+                _emit_thinking("timeline_citations", timeline_citations)
+
     # Critique
     critique = ""
     remaining = time_left()
@@ -976,7 +1225,15 @@ def solve_with_budget(
         _emit_thinking("critique_phase", "Phase 3: Critiquing worker outputs")
         try:
             critique, timed_out = _run_with_timeout(
-                lambda: supervisor.critique(problem, results, web_evidence=web_evidence_for_context),
+                lambda: supervisor.critique(
+                    problem,
+                    results,
+                    web_evidence=web_evidence_for_context,
+                    rag_evidence="\n\n".join(
+                        [p.format_context(max_length=2500) for p in rag_evidence_packs[:3] if p.chunks]
+                        + ([timeline_context] if timeline_context else [])
+                    ),
+                ),
                 timeout_seconds=min(per_op_timeout, remaining),
                 default_value="OK"
             )
@@ -995,8 +1252,24 @@ def solve_with_budget(
         try:
             # Give synthesis a reasonable minimum timeout
             synth_timeout = max(min(per_op_timeout, remaining) if remaining > 0 else 30, 30.0)
+            # Build RAG evidence, including quality warning if applicable
+            rag_evidence_parts = [p.format_context(max_length=2500) for p in rag_evidence_packs[:3] if p.chunks]
+            if timeline_context:
+                rag_evidence_parts.append(timeline_context)
+            if rag_quality_warning:
+                rag_evidence_parts.append(f"[RAG Quality Warning: {rag_quality_warning}]")
+            
             synth_result, timed_out = _run_with_timeout(
-                lambda: supervisor.synthesize(problem, results, web_evidence=web_evidence_for_context),
+                lambda: supervisor.synthesize(
+                    problem,
+                    results,
+                    web_evidence=web_evidence_for_context,
+                    rag_evidence="\n\n".join(rag_evidence_parts),
+                    rag_citations="\n".join(
+                        [p.format_citations() for p in rag_evidence_packs[:3] if p.chunks]
+                        + ([timeline_citations] if timeline_citations else [])
+                    ),
+                ),
                 timeout_seconds=synth_timeout,
                 default_value=""
             )
@@ -1015,7 +1288,20 @@ def solve_with_budget(
                 _emit_thinking("repair_attempt", "Attempting to repair based on critique")
                 original_final = final  # Preserve original answer
                 fixed, timed_out_repair = _run_with_timeout(
-                    lambda: supervisor.resynthesize_with_critique(problem, results, critique, web_evidence=web_evidence_for_context),
+                    lambda: supervisor.resynthesize_with_critique(
+                        problem,
+                        results,
+                        critique,
+                        web_evidence=web_evidence_for_context,
+                        rag_evidence="\n\n".join(
+                            [p.format_context(max_length=2500) for p in rag_evidence_packs[:3] if p.chunks]
+                            + ([timeline_context] if timeline_context else [])
+                        ),
+                        rag_citations="\n".join(
+                            [p.format_citations() for p in rag_evidence_packs[:3] if p.chunks]
+                            + ([timeline_citations] if timeline_citations else [])
+                        ),
+                    ),
                     timeout_seconds=min(30, max(time_left(), 15)),
                     default_value=None
                 )
@@ -1049,7 +1335,20 @@ def solve_with_budget(
                         "- Do NOT introduce alternative entities not present in Web Evidence."
                     )
                     repaired, _ = _run_with_timeout(
-                        lambda: supervisor.resynthesize_with_critique(problem, results, critique_note, web_evidence=web_evidence_for_context),
+                        lambda: supervisor.resynthesize_with_critique(
+                            problem,
+                            results,
+                            critique_note,
+                            web_evidence=web_evidence_for_context,
+                            rag_evidence="\n\n".join(
+                                [p.format_context(max_length=2500) for p in rag_evidence_packs[:3] if p.chunks]
+                                + ([timeline_context] if timeline_context else [])
+                            ),
+                            rag_citations="\n".join(
+                                [p.format_citations() for p in rag_evidence_packs[:3] if p.chunks]
+                                + ([timeline_citations] if timeline_citations else [])
+                            ),
+                        ),
                         timeout_seconds=min(25, max(time_left(), 10)),
                         default_value=None,
                     )

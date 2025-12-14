@@ -81,6 +81,12 @@ class HybridRetriever:
         self.semantic_weight = semantic_weight
         self.lexical_weight = lexical_weight
         self._emit = thinking_callback or (lambda s, c: None)
+
+        # Simple per-instance caches/limits (avoid repeated embedding + improve diversity).
+        self._query_embed_cache: Dict[str, np.ndarray] = {}
+        self._query_embed_cache_max = 128
+        self._max_fallback_scan_rows = 5000  # avoid table.to_pandas() on huge DBs
+        self._max_per_doc_results = 2  # diversity cap for fusion results
         
         # Connect to database
         self.db = lancedb.connect(db_path)
@@ -139,8 +145,8 @@ class HybridRetriever:
         if not query or not query.strip():
             return []
         
-        # Embed query
-        query_vec = self.embedder.embed_query(query)
+        # Embed query (cached)
+        query_vec = self._embed_query_cached(query)
         
         # Vector search
         results = (
@@ -170,7 +176,7 @@ class HybridRetriever:
         if not query or not query.strip():
             return []
         
-        query_vec = self.embedder.embed_query(query)
+        query_vec = self._embed_query_cached(query)
         
         results = (
             self.table
@@ -239,7 +245,18 @@ class HybridRetriever:
         if not query_tokens:
             return []
         
-        # Scan table and score by token overlap
+        # Scan table and score by token overlap (bounded; full scan is too expensive for large DBs)
+        try:
+            n_rows = int(self.table.count_rows())
+        except Exception:
+            n_rows = 0
+        if n_rows and n_rows > self._max_fallback_scan_rows:
+            self._emit(
+                "retrieval_warning",
+                f"FTS unavailable and table is large (rows={n_rows}); skipping fallback lexical scan",
+            )
+            return []
+
         all_rows = self.table.to_pandas()
         scores = []
         
@@ -398,9 +415,70 @@ class HybridRetriever:
             elif sources:
                 chunk.retrieval_method = f"fusion({sources[0]})"
         
+        # Diversity + dedup (avoid flooding with many chunks from same doc)
+        chunks = self._diversify_chunks(chunks)
+
+        # Emit UI-friendly chunk summaries
+        self._emit_chunk_summary(query=query, chunks=chunks)
+
         self._emit("retrieval_complete", f"Returned {len(chunks)} chunks via RRF fusion")
         
         return chunks
+
+    def _embed_query_cached(self, query: str) -> np.ndarray:
+        q = (query or "").strip()
+        if not q:
+            return np.zeros(self.embedder.dimension, dtype=np.float32)
+        hit = self._query_embed_cache.get(q)
+        if hit is not None:
+            return hit
+        vec = self.embedder.embed_query(q)
+        # Simple FIFO eviction
+        if len(self._query_embed_cache) >= self._query_embed_cache_max:
+            oldest_key = next(iter(self._query_embed_cache.keys()))
+            self._query_embed_cache.pop(oldest_key, None)
+        self._query_embed_cache[q] = vec
+        return vec
+
+    def _diversify_chunks(self, chunks: List[RetrievedChunk]) -> List[RetrievedChunk]:
+        if not chunks:
+            return []
+        out: List[RetrievedChunk] = []
+        per_doc: Dict[str, int] = {}
+        seen_ids: set[str] = set()
+        for ch in chunks:
+            if not ch.id or ch.id in seen_ids:
+                continue
+            seen_ids.add(ch.id)
+            d = ch.doc_id or ch.url or ""
+            per_doc[d] = per_doc.get(d, 0) + 1
+            if per_doc[d] > self._max_per_doc_results:
+                continue
+            out.append(ch)
+        return out
+
+    def _emit_chunk_summary(self, query: str, chunks: List[RetrievedChunk]) -> None:
+        """
+        Emit a compact markdown summary of retrieved chunks.
+        UI can render this directly in the thinking panel.
+        """
+        if not chunks:
+            self._emit("rag_chunks", "_(no retrieved chunks)_")
+            return
+        lines: List[str] = []
+        for i, ch in enumerate(chunks[:8], 1):
+            title = (ch.title or "").strip()[:80]
+            url = (ch.url or "").strip()
+            snippet = " ".join((ch.text or "").strip().split())
+            if len(snippet) > 220:
+                snippet = snippet[:220].rstrip() + "…"
+            if title and url:
+                lines.append(f"- [R{i}] **{title}** (score={ch.score:.3f}) — {url}\n  - {snippet}")
+            elif url:
+                lines.append(f"- [R{i}] (score={ch.score:.3f}) — {url}\n  - {snippet}")
+            else:
+                lines.append(f"- [R{i}] (score={ch.score:.3f})\n  - {snippet}")
+        self._emit("rag_chunks", "\n".join(lines))
     
     def search(
         self,

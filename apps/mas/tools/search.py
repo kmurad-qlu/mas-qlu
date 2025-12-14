@@ -4,10 +4,16 @@ Web Search Tool using DuckDuckGo.
 Provides real-time web search for current events and recent information.
 Uses news search for better current events coverage.
 """
-from duckduckgo_search import DDGS
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Optional, Tuple, Union
 import re
+
+try:
+    from duckduckgo_search import DDGS  # type: ignore
+    _DDGS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    DDGS = None  # type: ignore[assignment]
+    _DDGS_AVAILABLE = False
 
 
 @dataclass
@@ -60,6 +66,13 @@ def search_web(
     
     Returns a formatted string of search results.
     """
+    if not _DDGS_AVAILABLE:
+        msg = "duckduckgo_search is not installed (pip install duckduckgo_search)"
+        if return_format == "results":
+            return []
+        if return_format == "both":
+            return f"[Error] Search unavailable: {msg}", []
+        return f"[Error] Search unavailable: {msg}"
     try:
         ddgs = DDGS()
         out: List[WebResult] = []

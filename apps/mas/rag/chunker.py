@@ -26,6 +26,8 @@ def chunk_text(
     chunk_size: int = 512,
     overlap: int = 50,
     min_chunk_size: int = 100,
+    chunk_size_tokens: Optional[int] = None,
+    overlap_tokens: Optional[int] = None,
 ) -> List[str]:
     """
     Split text into overlapping chunks.
@@ -35,10 +37,17 @@ def chunk_text(
         chunk_size: Target size for each chunk (in characters)
         overlap: Number of characters to overlap between chunks
         min_chunk_size: Minimum chunk size (avoid tiny trailing chunks)
+        chunk_size_tokens: Optional token-aware target chunk size (approx; uses ~4 chars/token).
+        overlap_tokens: Optional token-aware overlap size (approx; uses ~4 chars/token).
     
     Returns:
         List of text chunks
     """
+    # Token-aware convenience: approximate tokens -> chars (roughly 4 chars per token).
+    if chunk_size_tokens is not None:
+        chunk_size = max(1, int(chunk_size_tokens) * 4)
+    if overlap_tokens is not None:
+        overlap = max(0, int(overlap_tokens) * 4)
     if not text or len(text) <= chunk_size:
         return [text] if text else []
     
@@ -93,6 +102,8 @@ def chunk_text_with_metadata(
     chunk_size: int = 512,
     overlap: int = 50,
     min_chunk_size: int = 100,
+    chunk_size_tokens: Optional[int] = None,
+    overlap_tokens: Optional[int] = None,
 ) -> List[Chunk]:
     """
     Split text into overlapping chunks with position metadata.
@@ -102,10 +113,16 @@ def chunk_text_with_metadata(
         chunk_size: Target size for each chunk (in characters)
         overlap: Number of characters to overlap between chunks
         min_chunk_size: Minimum chunk size
+        chunk_size_tokens: Optional token-aware target chunk size (approx; uses ~4 chars/token).
+        overlap_tokens: Optional token-aware overlap size (approx; uses ~4 chars/token).
     
     Returns:
         List of Chunk objects with position information
     """
+    if chunk_size_tokens is not None:
+        chunk_size = max(1, int(chunk_size_tokens) * 4)
+    if overlap_tokens is not None:
+        overlap = max(0, int(overlap_tokens) * 4)
     if not text:
         return []
     
@@ -157,6 +174,8 @@ def chunk_document(
     url: str,
     chunk_size: int = 512,
     overlap: int = 50,
+    chunk_size_tokens: Optional[int] = None,
+    overlap_tokens: Optional[int] = None,
 ) -> List[dict]:
     """
     Chunk a document and return list of chunk dictionaries ready for indexing.
@@ -168,11 +187,19 @@ def chunk_document(
         url: Document URL
         chunk_size: Target chunk size in characters
         overlap: Overlap between chunks
+        chunk_size_tokens: Optional token-aware chunk size (approx; uses ~4 chars/token).
+        overlap_tokens: Optional token-aware overlap (approx; uses ~4 chars/token).
     
     Returns:
         List of dictionaries with chunk data
     """
-    chunks = chunk_text_with_metadata(text, chunk_size=chunk_size, overlap=overlap)
+    chunks = chunk_text_with_metadata(
+        text,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        chunk_size_tokens=chunk_size_tokens,
+        overlap_tokens=overlap_tokens,
+    )
     
     result = []
     for chunk in chunks:

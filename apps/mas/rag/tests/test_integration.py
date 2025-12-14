@@ -14,6 +14,9 @@ import tempfile
 import pytest
 import numpy as np
 
+# These integration tests require LanceDB.
+pytest.importorskip("lancedb")
+
 
 class MockEmbedder:
     """Mock embedder for testing without API calls."""

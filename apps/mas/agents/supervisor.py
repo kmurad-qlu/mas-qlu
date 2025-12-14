@@ -422,7 +422,14 @@ class SupervisorAgent:
         self._emit_thinking("decompose_complete", f"Plan created with {len(plan.subtasks)} subtasks: {subtask_summary}")
         return plan
 
-    def synthesize(self, problem: str, results: List[Tuple[SubTask, Any]], web_evidence: Optional[str] = None) -> str:
+    def synthesize(
+        self,
+        problem: str,
+        results: List[Tuple[SubTask, Any]],
+        web_evidence: Optional[str] = None,
+        rag_evidence: Optional[str] = None,
+        rag_citations: Optional[str] = None,
+    ) -> str:
         self._emit_thinking("synthesize_start", f"Synthesizing from {len(results)} worker results...")
         
         # Detect question type and use appropriate synthesis prompt
@@ -486,6 +493,16 @@ class SupervisorAgent:
         if web_evidence and web_evidence.strip():
             web_section = f"Web Evidence (search results):\n{web_evidence.strip()}\n\n"
 
+        rag_section = ""
+        rag_citations_section = ""
+        if rag_evidence and rag_evidence.strip():
+            rag_section = f"RAG Evidence (retrieved chunks):\n{rag_evidence.strip()}\n\n"
+        if rag_citations and rag_citations.strip():
+            rag_citations_section = (
+                "Citations (use [R#] for RAG chunks and [W#] for web/fetched pages if provided):\n"
+                f"{rag_citations.strip()}\n\n"
+            )
+
         messages = [
             {"role": "system", "content": system_content},
             {
@@ -493,6 +510,16 @@ class SupervisorAgent:
                 "content": f"Problem:\n{problem}\n\n{web_section}Worker outputs:\n{context}\n\nFinal answer:",
             },
         ]
+        # Add RAG only for formats where we can actually cite (avoid breaking strict numeric/boolean outputs).
+        if question_type in ("factual", "explanatory"):
+            messages[1]["content"] = (
+                f"Problem:\n{problem}\n\n"
+                f"{web_section}"
+                f"{rag_section}"
+                f"{rag_citations_section}"
+                f"Worker outputs:\n{context}\n\n"
+                "Final answer (cite sources using [R#] and/or [W#] where relevant; do not invent citations):"
+            )
         
         self._emit_thinking("synthesize_model", f"Querying model: {self.model_name or 'default'}")
         result = self.client.complete_chat(messages=messages, temperature=0.0, model=self.model_name)
@@ -534,6 +561,8 @@ class SupervisorAgent:
         results: List[Tuple[SubTask, Any]],
         critique: str,
         web_evidence: Optional[str] = None,
+        rag_evidence: Optional[str] = None,
+        rag_citations: Optional[str] = None,
     ) -> str:
         """
         Second-pass synthesis that explicitly incorporates the critique to fix issues.
@@ -600,6 +629,16 @@ class SupervisorAgent:
         if web_evidence and web_evidence.strip():
             web_section = f"Web Evidence (search results):\n{web_evidence.strip()}\n\n"
 
+        rag_section = ""
+        rag_citations_section = ""
+        if rag_evidence and rag_evidence.strip() and question_type in ("factual", "explanatory"):
+            rag_section = f"RAG Evidence (retrieved chunks):\n{rag_evidence.strip()}\n\n"
+        if rag_citations and rag_citations.strip() and question_type in ("factual", "explanatory"):
+            rag_citations_section = (
+                "Citations (use [R#] for RAG chunks and [W#] for web/fetched pages if provided):\n"
+                f"{rag_citations.strip()}\n\n"
+            )
+
         messages = [
             {"role": "system", "content": system_content},
             {
@@ -607,9 +646,11 @@ class SupervisorAgent:
                 "content": (
                     f"Problem:\n{problem}\n\n"
                     f"{web_section}"
+                    f"{rag_section}"
+                    f"{rag_citations_section}"
                     f"Worker outputs:\n{context}\n\n"
                     f"Critique (issues to fix):\n{critique}\n\n"
-                    "Provide the corrected final answer now:"
+                    "Provide the corrected final answer now (cite [R#] and/or [W#] when relevant; do not invent citations):"
                 ),
             },
         ]
@@ -623,7 +664,13 @@ class SupervisorAgent:
             text = result.text.strip()
         return text
 
-    def critique(self, problem: str, results: List[Tuple[SubTask, Any]], web_evidence: Optional[str] = None) -> str:
+    def critique(
+        self,
+        problem: str,
+        results: List[Tuple[SubTask, Any]],
+        web_evidence: Optional[str] = None,
+        rag_evidence: Optional[str] = None,
+    ) -> str:
         """
         Runtime QA: ask the model to check logical consistency.
         Returns a brief note; empty string if all good.
@@ -635,6 +682,9 @@ class SupervisorAgent:
         web_section = ""
         if web_evidence and web_evidence.strip():
             web_section = f"Web Evidence (search results):\n{web_evidence.strip()}\n\n"
+        rag_section = ""
+        if rag_evidence and rag_evidence.strip():
+            rag_section = f"RAG Evidence (retrieved chunks):\n{rag_evidence.strip()}\n\n"
 
         messages = [
             {
@@ -646,7 +696,7 @@ class SupervisorAgent:
             },
             {
                 "role": "user",
-                "content": f"Problem:\n{problem}\n\n{web_section}Worker outputs:\n{context}\n\nCritique:",
+                "content": f"Problem:\n{problem}\n\n{web_section}{rag_section}Worker outputs:\n{context}\n\nCritique:",
             },
         ]
         
