@@ -17,9 +17,10 @@ This document provides a comprehensive deep-dive into MAS architecture, covering
 9. [TGR Pipeline Enhancements](#tgr-pipeline-enhancements)
 10. [Question Type Detection & Output Formatting](#question-type-detection--output-formatting)
 11. [Consensus & Verification](#consensus--verification)
-12. [Configuration & Models](#configuration--models)
-13. [Entry Points & Benchmarks](#entry-points--benchmarks)
-14. [Code Organization](#code-organization)
+12. [Latent Communication](#latent-communication)
+13. [Configuration & Models](#configuration--models)
+14. [Entry Points & Benchmarks](#entry-points--benchmarks)
+15. [Code Organization](#code-organization)
 
 ---
 
@@ -96,7 +97,11 @@ apps/mas/
 │   ├── worker_logic.py        # Logical reasoning
 │   ├── worker_qa.py           # Question answering
 │   ├── worker_researcher.py   # Code-first research (Ouroboros)
-│   └── verifier.py            # Numeric verification
+│   ├── verifier.py            # Numeric verification
+│   └── latent/                # Inter-agent hidden state sharing
+│       ├── latent_state.py    # LatentState, AttentionMap dataclasses
+│       ├── latent_encoder.py  # Embedding and attention extraction
+│       └── latent_bus.py      # Pub/sub communication bus
 │
 ├── graph/                     # TGR and orchestration
 │   ├── plan_graph.py          # Main entry: solve_with_budget()
@@ -1829,6 +1834,167 @@ def verify_with_template(problem, answer, template_id):
 
 ---
 
+## Latent Communication
+
+Latent Communication enables inter-agent hidden state sharing, allowing agents to communicate richer information than plain text strings.
+
+### The Problem
+
+Traditional multi-agent systems communicate via natural language:
+```
+Agent A → "The answer is 42 because..." → Agent B
+```
+
+This loses important meta-information:
+- How confident is Agent A in this answer?
+- What parts of the context did it focus on?
+- Are there uncertainties it didn't express in words?
+
+### Solution: Hidden State Sharing
+
+With latent communication, agents share structured hidden states:
+
+```python
+Agent A → {
+    "text": "The answer is 42...",
+    "embedding": [0.23, -0.11, ...],     # Dense vector
+    "confidence": 0.92,                   # Certainty score
+    "attention": {"France": 0.8, ...},   # What mattered
+} → Agent B
+```
+
+### Architecture
+
+```text
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         LatentCommunicationBus                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │  State A    │  │  State B    │  │  State C    │  │ Consensus   │    │
+│  │ emb=[...]   │  │ emb=[...]   │  │ emb=[...]   │  │ emb=[...]   │    │
+│  │ conf=0.9    │  │ conf=0.7    │  │ conf=0.8    │  │             │    │
+│  │ attn={...}  │  │ attn={...}  │  │ attn={...}  │  │             │    │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └─────────────┘    │
+│         │                │                │                             │
+└─────────┼────────────────┼────────────────┼─────────────────────────────┘
+          │                │                │
+          ▼                ▼                ▼
+    ┌──────────┐     ┌──────────┐     ┌──────────┐
+    │ MathAgent│     │ LogicAgent│    │ QAAgent  │
+    └──────────┘     └──────────┘     └──────────┘
+```
+
+### Core Components
+
+#### LatentState
+
+```python
+@dataclass
+class LatentState:
+    agent_id: str
+    task_id: str
+    text_output: str              # Backward-compatible text
+    embedding: List[float]        # Dense vector representation
+    confidence: float             # 0-1 confidence score
+    uncertainty_regions: List[str]  # Uncertain parts
+    attention: AttentionMap       # Entity/chunk focus weights
+```
+
+#### AttentionMap
+
+```python
+@dataclass
+class AttentionMap:
+    entity_weights: Dict[str, float]  # Entity → importance
+    chunk_weights: Dict[str, float]   # RAG chunk → relevance
+    key_phrases: List[str]            # Important phrases
+```
+
+#### LatentEncoder
+
+```python
+class LatentEncoder:
+    def encode_text(self, text: str) -> List[float]:
+        """Generate embedding for text."""
+    
+    def estimate_confidence(self, text: str) -> float:
+        """Estimate confidence from uncertainty markers."""
+    
+    def extract_attention(self, text: str, context: str) -> AttentionMap:
+        """Extract attention weights from output."""
+```
+
+#### LatentCommunicationBus
+
+```python
+class LatentCommunicationBus:
+    def publish(self, state: LatentState) -> None:
+        """Publish agent's latent state."""
+    
+    def compute_consensus_embedding(self) -> List[float]:
+        """Compute weighted average embedding."""
+    
+    def find_disagreements(self) -> List[Disagreement]:
+        """Find agents with low embedding similarity."""
+    
+    def get_merged_attention(self) -> AttentionMap:
+        """Merge attention maps from all agents."""
+```
+
+### Key Features
+
+| Feature | Description |
+|---------|-------------|
+| **Embedding Similarity** | Detect semantic disagreements via cosine similarity |
+| **Confidence Propagation** | Low-confidence outputs flagged for verification |
+| **Attention Merging** | Combine focus maps to find key entities |
+| **Consensus Embedding** | Weighted average gives "group opinion" |
+| **Disagreement Detection** | Similarity < threshold triggers warnings |
+
+### Integration Points
+
+**SwarmWorkerManager** (optional):
+```python
+# After each response, publish latent state
+self._publish_latent_state(model, response, context, latency)
+
+# Before returning, check for disagreements
+self._check_latent_disagreements()
+```
+
+**SupervisorAgent.synthesize()** (optional):
+```python
+# Gather latent context from bus
+latent_context = self._gather_latent_context(latent_bus, problem)
+
+# Include in synthesis prompt
+"Latent Insights:\n{latent_context}\n\n"
+```
+
+### Configuration
+
+```yaml
+# apps/mas/configs/learning.yaml
+latent_communication:
+  enabled: false  # Disabled by default
+  embedding:
+    enabled: true
+    dim: 768
+  attention:
+    enabled: true
+  bus:
+    disagreement_threshold: 0.7
+    low_confidence_threshold: 0.6
+```
+
+### Backward Compatibility
+
+Latent communication is **fully optional** and backward-compatible:
+- When `latent_bus=None`, no overhead is added
+- `LatentState.to_context_string()` converts to plain text
+- All existing tests pass without modification
+
+---
+
 ## Configuration & Models
 
 ### Primary Config: `apps/mas/configs/openrouter.yaml`
@@ -1936,12 +2102,12 @@ python -m apps.mas.benchmarks.hotpotqa
 
 | File | Purpose | Lines |
 |------|---------|-------|
-| `graph/plan_graph.py` | Main orchestrator, `solve_with_budget()` | ~1000 |
+| `graph/plan_graph.py` | Main orchestrator, `solve_with_budget()`, parallel subtasks | ~1600 |
 | `agents/supervisor.py` | Decomposition, synthesis, question detection, current-info detection | ~545 |
 | `agents/websearch.py` | Web evidence + deterministic extraction | ~900 |
-| `agents/swarm_worker.py` | Multi-model parallel consensus | ~350 |
+| `agents/swarm_worker.py` | Multi-model parallel consensus, early termination | ~430 |
 | `agents/worker_researcher.py` | Ouroboros code loop | ~400 |
-| `graph/got_controller.py` | TGR DAG execution with RAG + backtracking | ~550 |
+| `graph/got_controller.py` | TGR DAG execution with RAG + backtracking + parallel nodes | ~920 |
 | `graph/template_distiller.py` | Template selection (keyword + RAG + dynamic gen) | ~450 |
 | `graph/template_generator.py` | Dynamic template generation via LLM | ~400 |
 | `graph/node_verifier.py` | Type-specific node output verification | ~350 |
@@ -1955,6 +2121,8 @@ python -m apps.mas.benchmarks.hotpotqa
 | `rag/embeddings.py` | Codestral embedder | ~230 |
 | `rag/indexer.py` | Wikipedia ingestion | ~360 |
 | `tools/search.py` | DuckDuckGo web search + structured WebResult | ~140 |
+| `tools/fetch.py` | URL fetching + concurrent fetch + relevance extraction | ~460 |
+| `infra/openrouter/client.py` | OpenAI-compatible API client + response caching | ~320 |
 
 ### Dependency Graph
 
@@ -1964,14 +2132,17 @@ plan_graph.py
 │   └── WebEvidencePack (intent + extracted_answer + sources)
 │       └── Supervisor/Workers (web evidence layer + grounding check)
 ├── _needs_current_info() ────► (from supervisor.py; optional/legacy routing)
-├── supervisor.py ─────────────► OpenRouterClient
-├── swarm_worker.py ──────────► OpenRouterClient
+├── supervisor.py ─────────────► OpenRouterClient (with ResponseCache)
+├── swarm_worker.py ──────────► OpenRouterClient (early consensus termination)
 ├── worker_researcher.py ─────► executor.py (sandbox)
 ├── verifier.py ──────────────► OpenRouterClient
 ├── template_distiller.py ────► (RAG optional)
 │   └── RAGTemplateDistiller ─► HybridRetriever
 ├── got_controller.py ────────► swarm_worker, researcher, verifier
-│   └── (RAG integration) ────► HybridRetriever
+│   ├── (RAG integration) ────► HybridRetriever
+│   └── (parallel nodes) ─────► ThreadPoolExecutor
+├── _execute_subtasks_parallel() ─► ThreadPoolExecutor (concurrent subtasks)
+├── fetch_urls_concurrent() ──► ThreadPoolExecutor (concurrent URL fetch)
 └── HybridRetriever
     ├── CodestralEmbedder ────► OpenRouter (embeddings)
     └── LanceDB ──────────────► wiki_chunks table
@@ -1985,7 +2156,7 @@ plan_graph.py
 2. **RAG Coverage**: Limited to indexed Wikipedia subset (quality detection now warns when content not found)
 3. **TGR Templates**: Keyword matching may miss edge cases (factual question detection helps prevent misrouting)
 4. **Code Execution**: Sandbox has 60s timeout, may fail for complex computations
-5. **Latent Module**: Experimental, not wired into main pipeline
+5. **Latent Communication**: Disabled by default; requires explicit configuration to enable
 6. **Question Detection**: Heuristic-based, may misclassify ambiguous questions
 7. **Web Search**: Dependent on DuckDuckGo availability; may get rate-limited
 8. **Current Events Detection**: Pattern-based, may miss some current-events questions
@@ -2000,9 +2171,10 @@ plan_graph.py
 3. ~~**Distillation Loop**: Learn from successful TGR traces~~ ✓ Implemented
 4. **Expanded RAG**: Full Wikipedia, arXiv, or custom knowledge bases
 5. **Multi-Modal**: Image/diagram understanding for visual problems
-6. **Latent Communication**: Inter-agent hidden state sharing
+6. ~~**Latent Communication**: Inter-agent hidden state sharing~~ ✓ Implemented
 7. ~~**Enhanced Web Search**: Multiple search providers, caching, smart query rewriting~~ ✓ Partially implemented (page fetching, timeline extraction)
 8. ~~**Hybrid RAG + Web**: Combine static RAG with live web search for comprehensive answers~~ ✓ Implemented (RAG URL crawling + timeline reasoning)
+9. ~~**Speed Optimization**: Parallelization, caching, and latency reduction~~ ✓ Implemented (parallel subtasks, TGR nodes, URL fetching, response cache, early termination)
 
 ### Recently Implemented (December 2025)
 
@@ -2037,6 +2209,43 @@ plan_graph.py
 - **Enhanced Factual Detection**: Sports terms (NFL, draft, touchdown, career) and strong patterns for template routing
 - **Pattern-Based Strong Signals**: "what are the key details", "first career touchdown", "selection in the [year]"
 
+#### Latent Communication (Inter-Agent Hidden State Sharing)
+- **LatentState Dataclass**: Structured representation with embedding, confidence, attention, and reasoning trace
+- **AttentionMap**: Entity/chunk weights showing what information agents focused on
+- **LatentEncoder**: Text-to-embedding conversion with confidence estimation and attention extraction
+- **LatentCommunicationBus**: Pub/sub system for agents to share hidden states
+- **Consensus Embedding**: Weighted average of agent embeddings for "group opinion"
+- **Disagreement Detection**: Find agents with low embedding similarity (< threshold)
+- **SwarmWorker Integration**: Optional latent state publishing after each response
+- **Supervisor Integration**: Optional latent context injection into synthesis prompts
+- **27 Unit Tests**: Full test coverage for all latent communication components
+
+#### Speed Optimization: Parallelization & Caching
+- **Early Consensus Termination**: Swarm stops waiting when `coop_min_agreement` models agree on the same normalized answer
+- **Answer Normalization**: Extracts `#### N` numeric format or first meaningful sentence for consensus comparison
+- **Parallel Subtask Execution**: Independent subtasks (no inter-dependencies) run concurrently via `ThreadPoolExecutor`
+- **`_execute_subtasks_parallel()`**: Batches independent subtasks with configurable `MAX_CONCURRENT_SUBTASKS` (default: 4)
+- **Parallel TGR Node Execution**: Level-by-level execution where nodes at the same dependency level run in parallel
+- **`_compute_dependency_levels()`**: Groups TGR nodes by BFS level for parallel scheduling
+- **`_execute_node_standard()`**: Refactored node execution for parallel-safe calling
+- **Concurrent URL Fetching**: `fetch_urls_concurrent()` fetches multiple URLs in parallel (default: 4 workers)
+- **`fetch_and_extract_relevant()`**: Combines concurrent fetch + relevance extraction
+- **LLM Response Caching**: `ResponseCache` with LRU eviction, TTL expiration, SHA-256 keying
+- **Deterministic-Only Caching**: Only caches `temperature=0.0` non-streaming calls
+- **Cache Statistics**: Hit rate, size, and TTL tracking via `get_cache_stats()`
+- **Speculative RAG Prefetch**: Runs decomposition and web evidence collection in parallel
+- **Configuration**: New `parallel:` and `caching:` sections in `openrouter.yaml`
+
+**Speed Improvement Summary:**
+| Feature | Expected Speedup | Implementation |
+|---------|------------------|----------------|
+| Early consensus termination | 10-40% | `swarm_worker.py` |
+| Parallel subtask execution | 2-4x (multi-subtask) | `plan_graph.py` |
+| Parallel TGR nodes | 1.5-3x (parallel branches) | `got_controller.py` |
+| Concurrent URL fetching | 2-4x (web-enabled) | `tools/fetch.py` |
+| LLM response caching | Variable (repeated queries) | `openrouter/client.py` |
+| Speculative prefetch | 1-3s saved | `plan_graph.py` |
+
 ---
 
-*Last updated: December 14, 2025 — Compound Question Detection, Enhanced Factual Routing*
+*Last updated: December 15, 2025 — Speed Optimization: Parallelization & Caching*

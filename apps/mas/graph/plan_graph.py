@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import concurrent.futures
 import threading
+from dataclasses import dataclass
 
 import yaml
 from langgraph.graph import END, StateGraph
@@ -178,6 +179,29 @@ def _run_with_timeout(func: Callable, timeout_seconds: float, default_value=None
             return default_value, True
         except Exception as e:
             raise e
+
+
+@dataclass
+class SubtaskExecutionResult:
+    """Result of executing a single subtask."""
+    subtask: SubTask
+    responses: List[Tuple[str, str]]
+    chosen: str
+    scratchpad_entries: List[Dict[str, Any]]
+    rag_pack: Optional[RAGEvidencePack] = None
+    wiki_fetched_urls: List[str] = None
+    wiki_fetch_blocks: List[str] = None
+    
+    def __post_init__(self):
+        if self.wiki_fetched_urls is None:
+            self.wiki_fetched_urls = []
+        if self.wiki_fetch_blocks is None:
+            self.wiki_fetch_blocks = []
+
+
+# Configuration for parallel execution
+PARALLEL_SUBTASKS_ENABLED = True
+MAX_CONCURRENT_SUBTASKS = 4
 
 
 def _load_openrouter_config(path: str) -> OpenRouterConfig:
@@ -460,6 +484,375 @@ def _pick_best_response(responses: List[Tuple[str, str]], fallback: str) -> str:
         if len(r) > len(best):
             best = r
     return best or fallback
+
+
+def _execute_single_subtask(
+    st: SubTask,
+    context: str,
+    problem: str,
+    plan: Plan,
+    swarm: SwarmWorkerManager,
+    researcher: ResearchWorker,
+    retriever: Any,
+    client: OpenRouterClient,
+    rag_top_k: int,
+    seed_rag_chunks: Optional[List[Any]],
+    web_enabled: bool,
+    web_evidence_for_context: str,
+    rag_url_fetch_combined: str,
+    timeline_context: str,
+    timeline_citations: str,
+    coop_enabled: bool,
+    coop_max_rounds: int,
+    coop_min_agreement: int,
+    per_op_timeout: float,
+    swarm_overall_timeout: float,
+    time_left: Callable[[], float],
+    emit_thinking: Callable[[str, str], None],
+    _fetched_rag_urls: Set[str],
+    _fetch_cache: Dict[str, FetchResult],
+) -> SubtaskExecutionResult:
+    """
+    Execute a single subtask and return its result.
+    This function is designed to be called in parallel for independent subtasks.
+    """
+    scratchpad_entries: List[Dict[str, Any]] = []
+    wiki_fetched_urls: List[str] = []
+    wiki_fetch_blocks: List[str] = []
+    
+    # Build context from dependencies + (optional) evidence
+    context_parts = [context] if context else []
+    
+    # Web Evidence layer: attach to QA/logic tasks by default
+    if web_evidence_for_context and st.role in ("qa", "logic"):
+        context_parts.append(f"[Web Evidence (search results)]:\n{web_evidence_for_context}")
+
+    # If we fetched Wikipedia pages based on RAG URLs, attach that too (web-enabled only).
+    if web_enabled and rag_url_fetch_combined and st.role in ("qa", "logic"):
+        context_parts.append(f"[Fetched Page Evidence (from RAG URLs)]:\n{rag_url_fetch_combined[:4500]}")
+
+    # Timeline inference layer (temporal constraints/range), if available
+    if timeline_context and st.role in ("qa", "logic"):
+        ctx = timeline_context
+        if timeline_citations:
+            ctx += "\nCitations:\n" + timeline_citations
+        context_parts.append(f"[Timeline Inference]:\n{ctx}")
+
+    # RAG Evidence layer: attach to QA/logic tasks by default (standard path)
+    rag_pack = _retrieve_rag_evidence_for_subtask(
+        retriever=retriever,
+        subtask=st,
+        original_problem=problem,
+        rag_top_k=rag_top_k,
+        time_left=time_left,
+        emit_thinking=emit_thinking,
+        seed_chunks=seed_rag_chunks if seed_rag_chunks else None,
+    )
+    if rag_pack:
+        rag_ctx = rag_pack.format_context(max_length=3500, include_titles=True)
+        if rag_ctx:
+            context_parts.append(f"[RAG Retrieved Evidence]:\n{rag_ctx}")
+
+        # If RAG returns Wikipedia URLs, crawl them (web enabled) and add extracts.
+        if web_enabled and time_left() > 15:
+            try:
+                wiki_urls: List[str] = []
+                for ch in rag_pack.chunks[:5]:
+                    u = (ch.url or "").strip()
+                    if not u:
+                        continue
+                    if "wikipedia.org/wiki/" in u and u not in _fetched_rag_urls and u not in wiki_urls:
+                        wiki_urls.append(u)
+                for u in wiki_urls[:1]:  # cap per subtask to avoid fetch storms
+                    emit_thinking("rag_url_fetch_start", f"Fetching Wikipedia page from RAG URL: {u}")
+                    fr = fetch_url_text(u, timeout_s=10.0, max_bytes=2_000_000, cache=_fetch_cache)
+                    if fr.error or not fr.text:
+                        emit_thinking("rag_url_fetch_error", f"Fetch failed: {u} ({fr.error})")
+                        continue
+                    snippet = select_relevant_passages(fr.text, st.instruction or problem, max_chars=4500)
+                    if snippet:
+                        wiki_fetched_urls.append(u)
+                        wiki_fetch_blocks.append(f"=== RAG URL Fetched: {u} ===\n{snippet}")
+                        emit_thinking("rag_url_fetch_ok", f"Fetched {u} snippet_chars={len(snippet)} status={fr.status_code}")
+            except Exception as e:
+                emit_thinking("rag_url_fetch_error", f"RAG URL fetch failed: {str(e)[:150]}")
+
+    full_context = "\n".join(context_parts) if context_parts else ""
+    
+    # Build instruction with context
+    full_instruction = st.instruction
+    if full_context:
+        full_instruction = f"{st.instruction}\n\nContext from previous steps:\n{full_context}"
+    
+    emit_thinking("worker_dispatch", f"[{st.id}]: [{st.role}] {st.instruction[:80]}...")
+    if full_context:
+        emit_thinking("worker_context", f"With context for subtask {st.id}")
+    
+    numeric_expected = _looks_single_number_question(problem, plan)
+    
+    # Research role: use ResearchWorker with code execution + iterative refinement
+    if st.role == "research":
+        research_resp, timed_out = _run_with_timeout(
+            lambda inst=full_instruction: researcher.run(inst, context=full_context),
+            timeout_seconds=min(per_op_timeout, time_left()),
+            default_value=""
+        )
+        if timed_out or not research_resp:
+            research_resp = "[Research worker timed out or returned empty]"
+        emit_thinking("worker_complete", f"Subtask '{st.id}' complete via ResearchWorker.")
+        return SubtaskExecutionResult(
+            subtask=st,
+            responses=[("research", research_resp)],
+            chosen=research_resp,
+            scratchpad_entries=scratchpad_entries,
+            rag_pack=rag_pack,
+            wiki_fetched_urls=wiki_fetched_urls,
+            wiki_fetch_blocks=wiki_fetch_blocks,
+        )
+
+    if not coop_enabled:
+        swarm_responses, timed_out = _run_with_timeout(
+            lambda inst=full_instruction, role=st.role: swarm.run(inst, role=role, context=full_context),
+            timeout_seconds=min(swarm_overall_timeout, time_left()),
+            default_value=[]
+        )
+        if timed_out or not swarm_responses:
+            emit_thinking("swarm_timeout", f"Swarm timed out for subtask '{st.id}'")
+            swarm_responses = [("timeout", f"[Swarm timed out for: {st.instruction[:80]}...]")]
+        chosen, agree = _compute_consensus(swarm_responses, numeric_expected)
+        chosen = chosen or next((r for _, r in swarm_responses if r and not r.startswith("[")), "")
+        valid_count = sum(1 for _, r in swarm_responses if r and not r.startswith("["))
+        emit_thinking("worker_complete", f"Subtask '{st.id}' complete: {valid_count} valid responses (consensus={agree})")
+        return SubtaskExecutionResult(
+            subtask=st,
+            responses=swarm_responses,
+            chosen=chosen or f"[No valid result for {st.id}]",
+            scratchpad_entries=scratchpad_entries,
+            rag_pack=rag_pack,
+            wiki_fetched_urls=wiki_fetched_urls,
+            wiki_fetch_blocks=wiki_fetch_blocks,
+        )
+
+    # Cooperative multi-round
+    prev_responses: List[Tuple[str, str]] = []
+    round_idx = 1
+    chosen = ""
+    while round_idx <= coop_max_rounds and time_left() > 0:
+        peer_snippets = []
+        for m, r in prev_responses[:4]:
+            if r and not r.startswith("["):
+                peer_snippets.append(f"{m}: {r[:120]}")
+        swarm_responses, timed_out = _run_with_timeout(
+            lambda inst=full_instruction, role=st.role, peers=prev_responses: swarm.run(
+                inst,
+                role=role,
+                context=full_context,
+                peer_responses=prev_responses,
+                round_idx=round_idx,
+                reconcile=(round_idx > 1),
+            ),
+            timeout_seconds=min(swarm_overall_timeout, time_left()),
+            default_value=[]
+        )
+        if timed_out or not swarm_responses:
+            emit_thinking("swarm_timeout", f"Swarm timed out for subtask '{st.id}' (round {round_idx})")
+            swarm_responses = [("timeout", f"[Swarm timed out for: {st.instruction[:]}...]")]
+
+        # Record scratchpad
+        for model_name, resp in swarm_responses:
+            scratchpad_entries.append({
+                "round": round_idx,
+                "subtask_id": st.id,
+                "model": model_name,
+                "response": resp,
+            })
+
+        prev_responses.extend(swarm_responses)
+        winner, agree = _compute_consensus(prev_responses, numeric_expected)
+        emit_thinking("coop_status", f"Subtask '{st.id}' round {round_idx}: agreement={agree}, winner='{winner}'")
+
+        winner_is_scalar = bool(winner and re.fullmatch(r"[+-]?\\d+(?:\\.\\d+)?", winner))
+        time_low = time_left() < 10
+        if winner_is_scalar and agree < coop_min_agreement and round_idx < coop_max_rounds:
+            round_idx += 1
+            continue
+
+        chosen = _pick_best_response(prev_responses, winner)
+        has_structured = any(
+            r and not r.startswith("[") and (
+                any(tok in r.lower() for tok in ["room", "list", "blue", "enumerate", "table"])
+                or any(ch in r for ch in ["[", "]", "{", "}", ","])
+                or len(r.split()) > 30
+            )
+            for _, r in prev_responses
+        )
+        # If only scalars / no evidence and we have another round, force another round
+        if (winner_is_scalar or not has_structured) and round_idx < coop_max_rounds:
+            round_idx += 1
+            continue
+        if agree >= coop_min_agreement or round_idx == coop_max_rounds or time_low:
+            chosen = chosen or winner or next((r for _, r in prev_responses if r and not r.startswith("[")), "")
+            break
+        round_idx += 1
+
+    valid_count = sum(1 for _, r in prev_responses if r and not r.startswith("["))
+    emit_thinking("worker_complete", f"Subtask '{st.id}' complete: {valid_count} responses, chosen='{chosen}'")
+    
+    return SubtaskExecutionResult(
+        subtask=st,
+        responses=prev_responses,
+        chosen=chosen or f"[No valid result for {st.id}]",
+        scratchpad_entries=scratchpad_entries,
+        rag_pack=rag_pack,
+        wiki_fetched_urls=wiki_fetched_urls,
+        wiki_fetch_blocks=wiki_fetch_blocks,
+    )
+
+
+def _execute_subtasks_parallel(
+    ready_subtasks: List[SubTask],
+    completed_ids: Set[str],
+    results_by_id: Dict[str, str],
+    subtask_by_id: Dict[str, SubTask],
+    problem: str,
+    plan: Plan,
+    swarm: SwarmWorkerManager,
+    researcher: ResearchWorker,
+    retriever: Any,
+    client: OpenRouterClient,
+    rag_top_k: int,
+    seed_rag_chunks: Optional[List[Any]],
+    web_enabled: bool,
+    web_evidence_for_context: str,
+    rag_url_fetch_combined: str,
+    timeline_context: str,
+    timeline_citations: str,
+    coop_enabled: bool,
+    coop_max_rounds: int,
+    coop_min_agreement: int,
+    per_op_timeout: float,
+    swarm_overall_timeout: float,
+    time_left: Callable[[], float],
+    emit_thinking: Callable[[str, str], None],
+    _fetched_rag_urls: Set[str],
+    _fetch_cache: Dict[str, FetchResult],
+) -> List[SubtaskExecutionResult]:
+    """
+    Execute multiple independent subtasks in parallel.
+    Returns list of execution results.
+    """
+    if not ready_subtasks:
+        return []
+    
+    # Build dependency contexts for each ready subtask
+    def build_dep_context(st: SubTask) -> str:
+        parts = []
+        if st.depends_on:
+            emit_thinking("multihop_context", f"Subtask '{st.id}' depends on: {st.depends_on}")
+            for dep_id in st.depends_on:
+                if dep_id in results_by_id:
+                    dep_st = subtask_by_id.get(dep_id)
+                    dep_instruction = dep_st.instruction[:50] if dep_st else dep_id
+                    parts.append(f"[Result from '{dep_id}' ({dep_instruction}...)]: {results_by_id[dep_id]}")
+        return "\n".join(parts)
+    
+    # If only one subtask or parallel disabled, execute sequentially
+    if len(ready_subtasks) == 1 or not PARALLEL_SUBTASKS_ENABLED:
+        results = []
+        for st in ready_subtasks:
+            if time_left() <= 0:
+                break
+            context = build_dep_context(st)
+            result = _execute_single_subtask(
+                st=st,
+                context=context,
+                problem=problem,
+                plan=plan,
+                swarm=swarm,
+                researcher=researcher,
+                retriever=retriever,
+                client=client,
+                rag_top_k=rag_top_k,
+                seed_rag_chunks=seed_rag_chunks,
+                web_enabled=web_enabled,
+                web_evidence_for_context=web_evidence_for_context,
+                rag_url_fetch_combined=rag_url_fetch_combined,
+                timeline_context=timeline_context,
+                timeline_citations=timeline_citations,
+                coop_enabled=coop_enabled,
+                coop_max_rounds=coop_max_rounds,
+                coop_min_agreement=coop_min_agreement,
+                per_op_timeout=per_op_timeout,
+                swarm_overall_timeout=swarm_overall_timeout,
+                time_left=time_left,
+                emit_thinking=emit_thinking,
+                _fetched_rag_urls=_fetched_rag_urls,
+                _fetch_cache=_fetch_cache,
+            )
+            results.append(result)
+        return results
+    
+    # Execute in parallel
+    emit_thinking("parallel_dispatch", f"Executing {len(ready_subtasks)} independent subtasks in parallel")
+    
+    max_workers = min(len(ready_subtasks), MAX_CONCURRENT_SUBTASKS)
+    execution_results: List[SubtaskExecutionResult] = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Build contexts first (not parallelized - fast)
+        subtask_contexts = {st.id: build_dep_context(st) for st in ready_subtasks}
+        
+        # Submit all subtasks
+        future_to_subtask = {
+            executor.submit(
+                _execute_single_subtask,
+                st=st,
+                context=subtask_contexts[st.id],
+                problem=problem,
+                plan=plan,
+                swarm=swarm,
+                researcher=researcher,
+                retriever=retriever,
+                client=client,
+                rag_top_k=rag_top_k,
+                seed_rag_chunks=seed_rag_chunks,
+                web_enabled=web_enabled,
+                web_evidence_for_context=web_evidence_for_context,
+                rag_url_fetch_combined=rag_url_fetch_combined,
+                timeline_context=timeline_context,
+                timeline_citations=timeline_citations,
+                coop_enabled=coop_enabled,
+                coop_max_rounds=coop_max_rounds,
+                coop_min_agreement=coop_min_agreement,
+                per_op_timeout=per_op_timeout,
+                swarm_overall_timeout=swarm_overall_timeout,
+                time_left=time_left,
+                emit_thinking=emit_thinking,
+                _fetched_rag_urls=_fetched_rag_urls,
+                _fetch_cache=_fetch_cache,
+            ): st
+            for st in ready_subtasks
+        }
+        
+        # Collect results as they complete
+        try:
+            for future in concurrent.futures.as_completed(future_to_subtask, timeout=time_left()):
+                st = future_to_subtask[future]
+                try:
+                    result = future.result(timeout=5.0)
+                    execution_results.append(result)
+                except Exception as e:
+                    emit_thinking("parallel_error", f"Subtask '{st.id}' failed: {str(e)[:150]}")
+                    execution_results.append(SubtaskExecutionResult(
+                        subtask=st,
+                        responses=[("error", f"[Error: {str(e)[:100]}]")],
+                        chosen=f"[Error: {str(e)[:50]}]",
+                        scratchpad_entries=[],
+                    ))
+        except concurrent.futures.TimeoutError:
+            emit_thinking("parallel_timeout", f"Parallel execution timed out, got {len(execution_results)} results")
+    
+    return execution_results
 
 
 def build_graph(config_path: str) -> StateGraph:
@@ -909,26 +1302,123 @@ def solve_with_budget(
                 scratchpad=tgr_result.trace,
             )
     
-    # Decompose
+    # Decompose (with speculative prefetch for web evidence if enabled)
     if time_left() <= 0:
         _emit_thinking("timeout", "Timeout before decomposition")
         return GraphState(problem=problem, thinking_log=get_thinking_log(), final_answer="Timeout before processing could begin.")
     
     _emit_thinking("decompose_phase", "Phase 1: Problem decomposition")
-    try:
-        plan, timed_out = _run_with_timeout(
-            lambda: supervisor.decompose(problem),
-            timeout_seconds=min(per_op_timeout, time_left()),
-            default_value=None
-        )
-        if timed_out or plan is None:
-            _emit_thinking("decompose_timeout", "Decomposition timed out, using fallback plan")
+    
+    # Speculative prefetch: run decomposition and web evidence collection in parallel
+    plan: Optional[Plan] = None
+    web_evidence: Optional[WebEvidencePack] = None
+    web_evidence_for_context = ""
+    timeline_context = ""
+    timeline_citations = ""
+    
+    should_prefetch_web = (
+        web_enabled and 
+        time_left() > 15 and 
+        not _looks_single_number_question(problem, None) and
+        PARALLEL_SUBTASKS_ENABLED  # Use same flag
+    )
+    
+    if should_prefetch_web:
+        # Parallel: decompose + web evidence collection
+        _emit_thinking("speculative_prefetch", "Running decomposition and web evidence collection in parallel")
+        
+        def _do_decompose() -> Optional[Plan]:
+            try:
+                p, timed_out = _run_with_timeout(
+                    lambda: supervisor.decompose(problem),
+                    timeout_seconds=min(per_op_timeout, time_left()),
+                    default_value=None
+                )
+                if timed_out or p is None:
+                    return Plan(subtasks=[SubTask(id="step1", role="qa", instruction=problem, depends_on=[])])
+                return p
+            except Exception:
+                return Plan(subtasks=[SubTask(id="step1", role="qa", instruction=problem, depends_on=[])])
+        
+        def _do_web_evidence() -> Optional[WebEvidencePack]:
+            try:
+                websearch_agent = WebSearchAgent(
+                    client=client,
+                    model_name=supervisor_model,
+                    max_searches=3,
+                    results_per_search=5,
+                )
+                websearch_agent.set_thinking_callback(_emit_thinking)
+                ev, timed_out = _run_with_timeout(
+                    lambda: websearch_agent.build_evidence(problem),
+                    timeout_seconds=min(45.0, time_left()),
+                    default_value=None,
+                )
+                if timed_out:
+                    return None
+                return ev
+            except Exception:
+                return None
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            decompose_future = executor.submit(_do_decompose)
+            web_future = executor.submit(_do_web_evidence)
+            
+            try:
+                plan = decompose_future.result(timeout=time_left())
+            except Exception as e:
+                _emit_thinking("decompose_error", f"Decomposition failed: {str(e)[:200]}")
+                plan = Plan(subtasks=[SubTask(id="step1", role="qa", instruction=problem, depends_on=[])])
+            
+            try:
+                web_evidence = web_future.result(timeout=time_left())
+            except Exception:
+                web_evidence = None
+        
+        if web_evidence and web_evidence.combined_results and web_evidence.combined_results.strip():
+            web_evidence_for_context = web_evidence.combined_results.strip()[:4500]
+            _emit_thinking(
+                "web_evidence_ready",
+                f"Web evidence collected: queries={len(web_evidence.queries)}, chars={len(web_evidence.combined_results)}"
+            )
+        
+        # Timeline inference (after parallel completion)
+        if web_evidence and web_evidence.combined_results and _is_temporal_question(problem) and time_left() > 20:
+            _emit_thinking("timeline_start", "Attempting timeline inference from web evidence")
+            timeline_input = web_evidence.combined_results
+            if rag_url_fetch_combined:
+                timeline_input = (timeline_input + "\n\n" + "=== RAG URL Page Evidence ===\n" + rag_url_fetch_combined).strip()
+            ext = extract_timeline(
+                client=client,
+                model=supervisor_model,
+                question=problem,
+                evidence_text=timeline_input,
+                emit=_emit_thinking,
+            )
+            if ext:
+                ans = solve_timeline(ext)
+                timeline_context = f"Timeline inference: {ans.format_answer()}\nRationale: {ans.rationale}"
+                timeline_citations = ans.format_citations(prefix="W")
+                _emit_thinking("timeline_answer", timeline_context)
+                if timeline_citations:
+                    _emit_thinking("timeline_citations", timeline_citations)
+    else:
+        # Sequential: decompose first
+        try:
+            plan, timed_out = _run_with_timeout(
+                lambda: supervisor.decompose(problem),
+                timeout_seconds=min(per_op_timeout, time_left()),
+                default_value=None
+            )
+            if timed_out or plan is None:
+                _emit_thinking("decompose_timeout", "Decomposition timed out, using fallback plan")
+                plan = Plan(subtasks=[SubTask(id="step1", role="qa", instruction=problem, depends_on=[])])
+        except Exception as e:
+            _emit_thinking("decompose_error", f"Decomposition failed: {str(e)[:200]}")
             plan = Plan(subtasks=[SubTask(id="step1", role="qa", instruction=problem, depends_on=[])])
-    except Exception as e:
-        _emit_thinking("decompose_error", f"Decomposition failed: {str(e)[:200]}")
-        plan = Plan(subtasks=[SubTask(id="step1", role="qa", instruction=problem, depends_on=[])])
 
     # Build Web Evidence once per problem (used as an evidence layer for QA/logic tasks)
+    # (Skip if already prefetched above)
     web_evidence: WebEvidencePack | None = None
     web_evidence_for_context = ""
     timeline_context = ""
@@ -1033,205 +1523,66 @@ def solve_with_budget(
             _emit_thinking("dependency_deadlock", f"No ready subtasks but {len(pending_subtasks)} pending - possible circular dependency")
             break
         
-        # Execute ready subtasks (could parallelize independent ones, but keeping sequential for simplicity)
-        for st in ready_subtasks:
-            remaining = time_left()
-            if remaining <= 0:
-                break
-            
-            # Build context from dependencies + (optional) web evidence
-            context_parts = []
-            if st.depends_on:
-                _emit_thinking("multihop_context", f"Subtask '{st.id}' depends on: {st.depends_on}")
-                for dep_id in st.depends_on:
-                    if dep_id in results_by_id:
-                        dep_st = subtask_by_id.get(dep_id)
-                        dep_instruction = dep_st.instruction[:50] if dep_st else dep_id
-                        context_parts.append(f"[Result from '{dep_id}' ({dep_instruction}...)]: {results_by_id[dep_id]}")
-            
-            # Web Evidence layer: attach to QA/logic tasks by default
-            if web_evidence_for_context and st.role in ("qa", "logic"):
-                context_parts.append(f"[Web Evidence (search results)]:\n{web_evidence_for_context}")
-
-            # If we fetched Wikipedia pages based on RAG URLs, attach that too (web-enabled only).
-            if web_enabled and rag_url_fetch_combined and st.role in ("qa", "logic"):
-                context_parts.append(f"[Fetched Page Evidence (from RAG URLs)]:\n{rag_url_fetch_combined[:4500]}")
-
-            # Timeline inference layer (temporal constraints/range), if available
-            if timeline_context and st.role in ("qa", "logic"):
-                ctx = timeline_context
-                if timeline_citations:
-                    ctx += "\nCitations:\n" + timeline_citations
-                context_parts.append(f"[Timeline Inference]:\n{ctx}")
-
-            # RAG Evidence layer: attach to QA/logic tasks by default (standard path)
-            # Use original problem for query and reuse seed chunks to avoid malformed queries
-            rag_pack = _retrieve_rag_evidence_for_subtask(
+        # Execute ready subtasks in parallel (or sequential if only one)
+        try:
+            exec_results = _execute_subtasks_parallel(
+                ready_subtasks=ready_subtasks,
+                completed_ids=completed_ids,
+                results_by_id=results_by_id,
+                subtask_by_id=subtask_by_id,
+                problem=problem,
+                plan=plan,
+                swarm=swarm,
+                researcher=researcher,
                 retriever=retriever,
-                subtask=st,
-                original_problem=problem,
+                client=client,
                 rag_top_k=rag_top_k,
+                seed_rag_chunks=seed_rag_chunks,
+                web_enabled=web_enabled,
+                web_evidence_for_context=web_evidence_for_context,
+                rag_url_fetch_combined=rag_url_fetch_combined,
+                timeline_context=timeline_context,
+                timeline_citations=timeline_citations,
+                coop_enabled=coop_enabled,
+                coop_max_rounds=coop_max_rounds,
+                coop_min_agreement=coop_min_agreement,
+                per_op_timeout=per_op_timeout,
+                swarm_overall_timeout=swarm_overall_timeout,
                 time_left=time_left,
                 emit_thinking=_emit_thinking,
-                seed_chunks=seed_rag_chunks if seed_rag_chunks else None,
+                _fetched_rag_urls=_fetched_rag_urls,
+                _fetch_cache=_fetch_cache,
             )
-            if rag_pack:
-                rag_evidence_packs.append(rag_pack)
-                rag_ctx = rag_pack.format_context(max_length=3500, include_titles=True)
-                if rag_ctx:
-                    context_parts.append(f"[RAG Retrieved Evidence]:\n{rag_ctx}")
-
-                # If RAG returns Wikipedia URLs, crawl them (web enabled) and add extracts.
-                if web_enabled and time_left() > 15:
-                    try:
-                        wiki_urls: List[str] = []
-                        for ch in rag_pack.chunks[:5]:
-                            u = (ch.url or "").strip()
-                            if not u:
-                                continue
-                            if "wikipedia.org/wiki/" in u and u not in _fetched_rag_urls and u not in wiki_urls:
-                                wiki_urls.append(u)
-                        for u in wiki_urls[:1]:  # cap per subtask to avoid fetch storms
-                            _emit_thinking("rag_url_fetch_start", f"Fetching Wikipedia page from RAG URL: {u}")
-                            fr = fetch_url_text(u, timeout_s=10.0, max_bytes=2_000_000, cache=_fetch_cache)
-                            if fr.error or not fr.text:
-                                _emit_thinking("rag_url_fetch_error", f"Fetch failed: {u} ({fr.error})")
-                                continue
-                            snippet = select_relevant_passages(fr.text, st.instruction or problem, max_chars=4500)
-                            if snippet:
-                                _fetched_rag_urls.add(u)
-                                rag_url_fetch_blocks.append(f"=== RAG URL Fetched: {u} ===\n{snippet}")
-                                rag_url_fetch_combined = ("\n\n".join(rag_url_fetch_blocks)).strip()
-                                _emit_thinking("rag_url_fetch_ok", f"Fetched {u} snippet_chars={len(snippet)} status={fr.status_code}")
-                    except Exception as e:
-                        _emit_thinking("rag_url_fetch_error", f"RAG URL fetch failed: {str(e)[:150]}")
-
-            context = "\n".join(context_parts) if context_parts else ""
             
-            # Build instruction with context
-            full_instruction = st.instruction
-            if context:
-                full_instruction = f"{st.instruction}\n\nContext from previous steps:\n{context}"
-            
-            subtask_idx = len(completed_ids) + 1
-            _emit_thinking("worker_dispatch", f"Subtask {subtask_idx}/{len(plan.subtasks)} [{st.id}]: [{st.role}] {st.instruction[:80]}...")
-            if context:
-                _emit_thinking("worker_context", f"With context from {len(st.depends_on)} dependencies")
-            
-            try:
-                numeric_expected = _looks_single_number_question(problem, plan)
-
-                # Research role: use ResearchWorker with code execution + iterative refinement
-                if st.role == "research":
-                    research_resp, timed_out = _run_with_timeout(
-                        lambda inst=full_instruction: researcher.run(inst, context=context),
-                        timeout_seconds=min(per_op_timeout, time_left()),
-                        default_value=""
-                    )
-                    if timed_out or not research_resp:
-                        research_resp = "[Research worker timed out or returned empty]"
-                    results.append((st, [("research", research_resp)]))
-                    results_by_id[st.id] = research_resp
-                    _emit_thinking("worker_complete", f"Subtask '{st.id}' complete via ResearchWorker.")
-                    completed_ids.add(st.id)
-                    pending_subtasks.remove(st)
-                    continue
-
-                if not coop_enabled:
-                    swarm_responses, timed_out = _run_with_timeout(
-                        lambda inst=full_instruction, role=st.role: swarm.run(inst, role=role, context=context),
-                        timeout_seconds=min(swarm_overall_timeout, remaining),
-                        default_value=[]
-                    )
-                    if timed_out or not swarm_responses:
-                        _emit_thinking("swarm_timeout", f"Swarm timed out for subtask '{st.id}'")
-                        swarm_responses = [("timeout", f"[Swarm timed out for: {st.instruction[:80]}...]")]
-                    chosen, agree = _compute_consensus(swarm_responses, numeric_expected)
-                    chosen = chosen or next((r for _, r in swarm_responses if r and not r.startswith("[")), "")
-                    results.append((st, swarm_responses))
-                    results_by_id[st.id] = chosen or f"[No valid result for {st.id}]"
-                    valid_count = sum(1 for _, r in swarm_responses if r and not r.startswith("["))
-                    _emit_thinking("worker_complete", f"Subtask '{st.id}' complete: {valid_count} valid responses (consensus={agree})")
-                    completed_ids.add(st.id)
-                    pending_subtasks.remove(st)
-                    continue
-
-                # Cooperative multi-round
-                prev_responses: List[Tuple[str, str]] = []
-                round_idx = 1
-                chosen = ""
-                while round_idx <= coop_max_rounds and time_left() > 0:
-                    peer_snippets = []
-                    for m, r in prev_responses[:4]:
-                        if r and not r.startswith("["):
-                            peer_snippets.append(f"{m}: {r[:120]}")
-                    peer_context = "\n".join(peer_snippets)
-                    swarm_responses, timed_out = _run_with_timeout(
-                        lambda inst=full_instruction, role=st.role, peers=prev_responses: swarm.run(
-                            inst,
-                            role=role,
-                            context=context,
-                            peer_responses=prev_responses,
-                            round_idx=round_idx,
-                            reconcile=(round_idx > 1),
-                        ),
-                        timeout_seconds=min(swarm_overall_timeout, time_left()),
-                        default_value=[]
-                    )
-                    if timed_out or not swarm_responses:
-                        _emit_thinking("swarm_timeout", f"Swarm timed out for subtask '{st.id}' (round {round_idx})")
-                        swarm_responses = [("timeout", f"[Swarm timed out for: {st.instruction[:]}...]")]
-
-                    # Record scratchpad
-                    for model_name, resp in swarm_responses:
-                        scratchpad.append({
-                            "round": round_idx,
-                            "subtask_id": st.id,
-                            "model": model_name,
-                            "response": resp,
-                        })
-
-                    prev_responses.extend(swarm_responses)
-                    winner, agree = _compute_consensus(prev_responses, numeric_expected)
-                    _emit_thinking("coop_status", f"Subtask '{st.id}' round {round_idx}: agreement={agree}, winner='{winner}'")
-
-                    winner_is_scalar = bool(winner and re.fullmatch(r"[+-]?\\d+(?:\\.\\d+)?", winner))
-                    time_low = time_left() < 10
-                    if winner_is_scalar and agree < coop_min_agreement and round_idx < coop_max_rounds:
-                        round_idx += 1
-                        continue
-
-                    chosen = _pick_best_response(prev_responses, winner)
-                    has_structured = any(
-                        r and not r.startswith("[") and (
-                            any(tok in r.lower() for tok in ["room", "list", "blue", "enumerate", "table"])
-                            or any(ch in r for ch in ["[", "]", "{", "}", ","])
-                            or len(r.split()) > 30
-                        )
-                        for _, r in prev_responses
-                    )
-                    # If only scalars / no evidence and we have another round, force another round and ask for self-check
-                    if (winner_is_scalar or not has_structured) and round_idx < coop_max_rounds:
-                        round_idx += 1
-                        continue
-                    if agree >= coop_min_agreement or round_idx == coop_max_rounds or time_low:
-                        chosen = chosen or winner or next((r for _, r in prev_responses if r and not r.startswith("[")), "")
-                        break
-                    round_idx += 1
-
-                results.append((st, prev_responses))
-                results_by_id[st.id] = chosen or f"[No valid result for {st.id}]"
-                valid_count = sum(1 for _, r in prev_responses if r and not r.startswith("["))
-                _emit_thinking("worker_complete", f"Subtask '{st.id}' complete: {valid_count} responses, chosen='{chosen}'")
+            # Process results
+            for exec_result in exec_results:
+                st = exec_result.subtask
+                results.append((st, exec_result.responses))
+                results_by_id[st.id] = exec_result.chosen
+                scratchpad.extend(exec_result.scratchpad_entries)
+                
+                # Collect RAG packs
+                if exec_result.rag_pack:
+                    rag_evidence_packs.append(exec_result.rag_pack)
+                
+                # Collect fetched URLs
+                for url in exec_result.wiki_fetched_urls:
+                    _fetched_rag_urls.add(url)
+                rag_url_fetch_blocks.extend(exec_result.wiki_fetch_blocks)
+                if exec_result.wiki_fetch_blocks:
+                    rag_url_fetch_combined = ("\n\n".join(rag_url_fetch_blocks)).strip()
+                
                 completed_ids.add(st.id)
                 pending_subtasks.remove(st)
-
-            except Exception as e:
-                _emit_thinking("worker_error", f"Swarm failed for subtask '{st.id}': {str(e)[:200]}")
+        except Exception as e:
+            _emit_thinking("parallel_error", f"Parallel execution failed: {str(e)[:200]}")
+            # Fall back to marking ready subtasks as failed
+            for st in ready_subtasks:
                 results.append((st, [("error", f"[Error: {str(e)[:100]}]")]))
                 results_by_id[st.id] = f"[Error: {str(e)[:50]}]"
                 completed_ids.add(st.id)
-                pending_subtasks.remove(st)
+                if st in pending_subtasks:
+                    pending_subtasks.remove(st)
     
     if pending_subtasks:
         _emit_thinking("dispatch_incomplete", f"{len(pending_subtasks)} subtasks could not be executed")

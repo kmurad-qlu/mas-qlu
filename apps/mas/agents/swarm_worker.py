@@ -3,15 +3,25 @@ SwarmWorker: Concurrent multi-model worker system.
 
 Dispatches the same task to multiple models in parallel and waits for
 at least N valid responses before returning.
+
+Supports optional latent communication for inter-agent hidden state sharing.
+Supports early consensus termination to avoid waiting for slow models.
 """
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
+import re
 import threading
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from collections import defaultdict
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ..infra.openrouter.client import OpenRouterClient
+
+# Optional latent communication imports
+if TYPE_CHECKING:
+    from .latent import LatentCommunicationBus, LatentEncoder
 
 
 # System prompts for different roles
@@ -71,6 +81,10 @@ SYSTEM_PROMPTS = {
 class SwarmWorkerManager:
     """
     Concurrent multi-model worker that dispatches tasks to all models in parallel.
+    
+    Supports optional latent communication for inter-agent hidden state sharing.
+    When enabled, publishes latent states to the bus after each response,
+    enabling richer consensus computation and disagreement detection.
     """
     
     def __init__(
@@ -83,6 +97,8 @@ class SwarmWorkerManager:
         cooperative: bool = True,
         coop_min_agreement: int = 2,
         coop_reconcile_prompt: str = "Peers disagree; reconcile and provide the single best answer.",
+        latent_bus: Optional["LatentCommunicationBus"] = None,
+        latent_encoder: Optional["LatentEncoder"] = None,
     ):
         """
         Initialize the swarm worker manager.
@@ -93,6 +109,11 @@ class SwarmWorkerManager:
             per_model_timeout: Timeout in seconds for each model
             min_responses: Minimum number of valid responses to wait for
             overall_timeout: Overall timeout for the swarm operation
+            cooperative: Whether to use cooperative consensus
+            coop_min_agreement: Minimum agreeing models for consensus
+            coop_reconcile_prompt: Prompt for reconciliation round
+            latent_bus: Optional LatentCommunicationBus for hidden state sharing
+            latent_encoder: Optional LatentEncoder for creating latent states
         """
         self.client = client
         self.models = models
@@ -112,6 +133,14 @@ class SwarmWorkerManager:
         )
         self._thinking_callback: Optional[Callable[[str, str], None]] = None
         self._lock = threading.Lock()
+        
+        # Latent communication (optional)
+        self.latent_bus = latent_bus
+        self.latent_encoder = latent_encoder
+        self._current_task_id: str = ""
+        
+        # Early consensus termination (default enabled)
+        self.early_consensus_enabled: bool = True
     
     def set_thinking_callback(self, callback: Callable[[str, str], None]) -> None:
         """Set callback for intermediate thinking: callback(stage, content)"""
@@ -120,6 +149,116 @@ class SwarmWorkerManager:
     def _emit_thinking(self, stage: str, content: str) -> None:
         if self._thinking_callback:
             self._thinking_callback(stage, content)
+    
+    def _publish_latent_state(
+        self,
+        model: str,
+        response: str,
+        context: str,
+        latency_ms: float,
+    ) -> None:
+        """
+        Publish a latent state to the bus (if configured).
+        This enables inter-agent hidden state sharing.
+        """
+        if self.latent_bus is None or self.latent_encoder is None:
+            return
+        
+        try:
+            state = self.latent_encoder.create_latent_state(
+                agent_id=f"swarm_{model}",
+                task_id=self._current_task_id,
+                text_output=response,
+                context=context,
+                model_name=model,
+                latency_ms=latency_ms,
+                include_embedding=True,
+                include_attention=True,
+                include_reasoning=False,  # Skip expensive reasoning extraction
+            )
+            self.latent_bus.publish(state)
+        except Exception as e:
+            self._emit_thinking("latent_error", f"Failed to publish latent state: {str(e)[:100]}")
+    
+    def _check_latent_disagreements(self) -> None:
+        """Check for disagreements in latent space and emit warnings."""
+        if self.latent_bus is None:
+            return
+        
+        try:
+            disagreements = self.latent_bus.find_disagreements(self._current_task_id)
+            if disagreements:
+                for d in disagreements[:2]:  # Report up to 2 disagreements
+                    self._emit_thinking(
+                        "latent_disagreement",
+                        f"Latent disagreement: {d.agent1} vs {d.agent2} (sim={d.similarity:.3f})"
+                    )
+        except Exception:
+            pass  # Non-critical, don't crash on latent errors
+    
+    def _normalize_answer_for_consensus(self, response: str) -> str:
+        """
+        Normalize an answer for consensus comparison.
+        Extracts numeric answers or normalizes text for comparison.
+        """
+        if not response or response.startswith("["):
+            return ""
+        
+        text = response.strip().lower()
+        
+        # Try to extract numeric answer (#### format)
+        match = re.search(r"####\s*([+-]?\d+(?:\.\d+)?)", response)
+        if match:
+            return match.group(1)
+        
+        # Try to extract final answer markers
+        for marker in ["final answer:", "answer:", "result:", "conclusion:"]:
+            idx = text.rfind(marker)
+            if idx >= 0:
+                after = text[idx + len(marker):].strip()
+                # Get first line or first 100 chars
+                first_line = after.split("\n")[0].strip()[:100]
+                if first_line:
+                    return first_line
+        
+        # For short responses, use whole response
+        if len(text) < 100:
+            return text
+        
+        # For long responses, use first sentence
+        sentences = re.split(r"[.!?]", text)
+        if sentences and sentences[0].strip():
+            return sentences[0].strip()[:100]
+        
+        return text[:100]
+    
+    def _check_early_consensus(
+        self,
+        responses: List[Tuple[str, str]],
+        min_agree: int = 2,
+    ) -> Optional[str]:
+        """
+        Check if we have strong consensus and can stop early.
+        
+        Returns the consensus answer if found, None otherwise.
+        """
+        if len(responses) < min_agree:
+            return None
+        
+        # Group responses by normalized answer
+        groups: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
+        for model, resp in responses:
+            key = self._normalize_answer_for_consensus(resp)
+            if key:  # Skip empty/invalid
+                groups[key].append((model, resp))
+        
+        # Check if any group has enough agreement
+        for key, members in groups.items():
+            if len(members) >= min_agree:
+                # Return the first response in the consensus group
+                return members[0][1]
+        
+        return None
     
     def _query_single_model(
         self,
@@ -153,6 +292,7 @@ class SwarmWorkerManager:
         peer_responses: Optional[List[Tuple[str, str]]] = None,
         round_idx: int = 1,
         reconcile: bool = False,
+        task_id: Optional[str] = None,
     ) -> List[Tuple[str, str]]:
         """
         Run the task on all models concurrently.
@@ -162,12 +302,19 @@ class SwarmWorkerManager:
             role: One of 'math', 'qa', 'logic'
             context: Optional context
             overall_timeout: Overall timeout (default: self.overall_timeout)
+            peer_responses: Previous responses for cooperative reconciliation
+            round_idx: Current round number
+            reconcile: Whether this is a reconciliation round
+            task_id: Optional task ID for latent state tracking
             
         Returns:
             List of (model_name, response) tuples for all valid responses
         """
         if overall_timeout is None:
             overall_timeout = self.overall_timeout
+        
+        # Set task ID for latent state tracking
+        self._current_task_id = task_id or instruction[:50]
         
         # Get the appropriate system prompt
         system_prompt = SYSTEM_PROMPTS.get(role, SYSTEM_PROMPTS["logic"])
@@ -231,28 +378,43 @@ class SwarmWorkerManager:
                                 "swarm_response",
                                 f"[{valid_count}/{len(self.models)}] {model} responded ({latency:.0f}ms): {response[:]}..."
                             )
+                            # Publish latent state for inter-agent communication
+                            self._publish_latent_state(model, response, context, latency)
                         else:
                             self._emit_thinking(
                                 "swarm_empty",
                                 f"{model} returned empty response ({latency:.0f}ms)"
                             )
                         
-                        # Check if we have enough responses - return IMMEDIATELY!
+                        # Check if we have enough responses
                         if valid_count >= self.min_responses:
-                            elapsed = time.perf_counter() - start_time
-                            self._emit_thinking(
-                                "swarm_sufficient",
-                                f"Got {valid_count} valid responses in {elapsed:.1f}s - returning NOW!"
-                            )
-                            # Force immediate shutdown - don't wait for remaining threads
-                            executor.shutdown(wait=False, cancel_futures=True)
+                            # Check for early consensus before returning
+                            consensus = None
+                            if self.early_consensus_enabled:
+                                consensus = self._check_early_consensus(
+                                    responses, 
+                                    min_agree=self.coop_min_agreement
+                                )
                             
-                            # Return immediately with what we have
-                            self._emit_thinking(
-                                "swarm_complete",
-                                f"Swarm returned early in {elapsed:.1f}s: {valid_count} valid responses"
-                            )
-                            return responses
+                            if consensus or not self.early_consensus_enabled:
+                                elapsed = time.perf_counter() - start_time
+                                reason = "consensus reached" if consensus else "min_responses met"
+                                self._emit_thinking(
+                                    "swarm_sufficient",
+                                    f"Got {valid_count} valid responses in {elapsed:.1f}s ({reason}) - returning NOW!"
+                                )
+                                # Force immediate shutdown - don't wait for remaining threads
+                                executor.shutdown(wait=False, cancel_futures=True)
+                                
+                                # Check for latent disagreements before returning
+                                self._check_latent_disagreements()
+                                
+                                # Return immediately with what we have
+                                self._emit_thinking(
+                                    "swarm_complete",
+                                    f"Swarm returned early in {elapsed:.1f}s: {valid_count} valid responses"
+                                )
+                                return responses
                             
                     except concurrent.futures.TimeoutError:
                         model = future_to_model[future]
@@ -284,5 +446,8 @@ class SwarmWorkerManager:
                     "fallback",
                     f"[Swarm failed] Unable to get sufficient responses for: {instruction[:]}..."
                 ))
+        
+        # Check for latent disagreements before returning
+        self._check_latent_disagreements()
         
         return responses

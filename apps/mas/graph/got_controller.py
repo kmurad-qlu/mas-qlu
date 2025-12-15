@@ -116,10 +116,16 @@ class GoTController:
     Hydrates a graph blueprint into runnable steps that leverage
     the existing swarm + research workers plus verifier.
     
-    Now supports RAG integration via:
-    - retrieval node type for mid-reasoning document retrieval
+    Now supports:
+    - RAG integration via retrieval node type for mid-reasoning document retrieval
     - knowledge seeds augmentation with retrieved context
+    - Parallel execution of independent nodes at the same dependency level
+    - Backtracking with intelligent retry strategies
     """
+
+    # Configuration for parallel node execution
+    PARALLEL_TGR_ENABLED = True
+    MAX_CONCURRENT_TGR_NODES = 3
 
     def __init__(
         self,
@@ -139,6 +145,7 @@ class GoTController:
         enable_backtracking: bool = False,  # Enable intelligent retry
         max_backtrack_depth: int = 3,  # Maximum backtrack depth
         max_retries_per_node: int = 2,  # Maximum retries per node
+        parallel_execution: bool = True,  # Enable parallel TGR node execution
     ):
         self.problem = problem
         self.template = template
@@ -155,6 +162,7 @@ class GoTController:
         self.trace_store = trace_store
         self.record_traces = record_traces
         self.enable_backtracking = enable_backtracking
+        self.parallel_execution = parallel_execution and self.PARALLEL_TGR_ENABLED
         
         # Cache for augmented seeds (computed once)
         self._augmented_seeds: Optional[List[str]] = None
@@ -336,6 +344,96 @@ class GoTController:
                     if indegree[tgt] == 0:
                         queue.append(tgt)
         return ordered
+    
+    def _compute_dependency_levels(self) -> List[List[str]]:
+        """
+        Compute dependency levels for parallel execution.
+        
+        Nodes at the same level have no dependencies on each other
+        and can be executed in parallel.
+        
+        Returns:
+            List of lists, where each inner list contains node IDs
+            that can be executed in parallel at that level.
+        """
+        # Compute in-degree for each node
+        indegree: Dict[str, int] = {nid: 0 for nid in self.nodes}
+        for src, tgt in self.edges:
+            if tgt in indegree:
+                indegree[tgt] += 1
+        
+        # BFS to group nodes by level
+        levels: List[List[str]] = []
+        current_level = [nid for nid, deg in indegree.items() if deg == 0]
+        
+        while current_level:
+            levels.append(current_level)
+            next_level: List[str] = []
+            
+            # For each node in current level, decrease in-degree of dependents
+            for nid in current_level:
+                for src, tgt in self.edges:
+                    if src == nid:
+                        indegree[tgt] -= 1
+                        if indegree[tgt] == 0:
+                            next_level.append(tgt)
+            
+            current_level = next_level
+        
+        return levels
+    
+    def _execute_node_standard(
+        self,
+        node: NodeSpec,
+        deps: List[str],
+        results: Dict[str, str],
+        start_time: float,
+    ) -> Tuple[str, bool, Optional[str], float]:
+        """
+        Execute a single node using standard (non-backtracking) execution.
+        
+        Returns:
+            Tuple of (output, success, error_message, duration_ms)
+        """
+        context = self._build_context(deps, results)
+        instruction = f"{node.instruction}\n\nContext:\n{context}"
+        numeric_expected = bool(re.search(r"####", node.instruction))
+        error_msg: Optional[str] = None
+        node_success = True
+        
+        node_start = time.perf_counter()
+        
+        try:
+            # Check timeout
+            if (time.perf_counter() - start_time) > self.overall_timeout:
+                return "[timeout]", False, "Overall timeout reached", 0.0
+            
+            # Handle different node types
+            if node.type == "retrieval" or node.role == "rag":
+                output = self._run_retrieval(node.instruction, context)
+            elif node.role == "research" or node.type == "calculation":
+                output = self._run_research(instruction, context=context)
+            elif node.type == "aggregation":
+                output = self._run_logic(instruction, role="logic", context=context, numeric_expected=numeric_expected)
+            elif node.type == "verification":
+                candidate = results.get(deps[-1], "") if deps else ""
+                numeric_guess = _extract_numeric(candidate) or candidate
+                verified = self.verifier.verify_numeric(self.problem, numeric_guess, context)
+                output = verified or candidate
+            else:
+                output = self._run_logic(instruction, role=node.role, context=context, numeric_expected=numeric_expected)
+
+            # Check for error indicators in output
+            if output.startswith("[") and ("error" in output.lower() or "timeout" in output.lower()):
+                node_success = False
+                error_msg = output[:200]
+        except Exception as e:
+            output = f"[error: {str(e)[:150]}]"
+            error_msg = str(e)[:200]
+            node_success = False
+        
+        duration_ms = (time.perf_counter() - node_start) * 1000
+        return output, node_success, error_msg, duration_ms
 
     def _execute_node(
         self,
@@ -510,88 +608,200 @@ class GoTController:
         if self.enable_backtracking:
             self._backtrack_manager.reset()
 
-        for node_id in ordered:
-            if (time.perf_counter() - start) > self.overall_timeout:
-                self._emit("tgr_timeout", "Overall TGR timeout reached")
+        # Use level-by-level parallel execution if enabled
+        if self.parallel_execution and not self.enable_backtracking:
+            levels = self._compute_dependency_levels()
+            self._emit("tgr_parallel_levels", f"Executing {len(levels)} levels with parallelism")
+            
+            for level_idx, level_nodes in enumerate(levels):
+                if (time.perf_counter() - start) > self.overall_timeout:
+                    self._emit("tgr_timeout", "Overall TGR timeout reached")
+                    break
+                
+                if len(level_nodes) == 1:
+                    # Single node - execute directly
+                    node_id = level_nodes[0]
+                    node = self.nodes[node_id]
+                    deps = [src for src, tgt in self.edges if tgt == node_id]
+                    
+                    self._emit("tgr_node_start", f"{node_id} ({node.type}/{node.role})")
+                    node_start = time.perf_counter()
+                    self._node_start_times[node_id] = node_start
+                    
+                    output, node_success, error_msg, duration_ms = self._execute_node_standard(
+                        node=node,
+                        deps=deps,
+                        results=results,
+                        start_time=start,
+                    )
+                    
+                    results[node_id] = output
+                    context = self._build_context(deps, results)
+                    trace.append({
+                        "node": node_id,
+                        "type": node.type,
+                        "role": node.role,
+                        "instruction": node.instruction[:300],
+                        "context": context[:500],
+                        "output": output,
+                        "duration_ms": duration_ms,
+                        "success": node_success,
+                        "error": error_msg,
+                        "retry_count": 0,
+                    })
+                else:
+                    # Multiple nodes at same level - parallelize
+                    self._emit("tgr_parallel_start", f"Level {level_idx + 1}: executing {len(level_nodes)} nodes in parallel")
+                    
+                    max_workers = min(len(level_nodes), self.MAX_CONCURRENT_TGR_NODES)
+                    
+                    def execute_node_for_parallel(node_id: str) -> Tuple[str, str, bool, Optional[str], float]:
+                        node = self.nodes[node_id]
+                        deps = [src for src, tgt in self.edges if tgt == node_id]
+                        self._emit("tgr_node_start", f"{node_id} ({node.type}/{node.role})")
+                        
+                        output, success, error, duration = self._execute_node_standard(
+                            node=node,
+                            deps=deps,
+                            results=results,
+                            start_time=start,
+                        )
+                        return node_id, output, success, error, duration
+                    
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {
+                            executor.submit(execute_node_for_parallel, node_id): node_id
+                            for node_id in level_nodes
+                        }
+                        
+                        remaining_time = self.overall_timeout - (time.perf_counter() - start)
+                        try:
+                            for future in concurrent.futures.as_completed(futures, timeout=max(remaining_time, 1.0)):
+                                try:
+                                    node_id, output, node_success, error_msg, duration_ms = future.result(timeout=2.0)
+                                    results[node_id] = output
+                                    
+                                    node = self.nodes[node_id]
+                                    deps = [src for src, tgt in self.edges if tgt == node_id]
+                                    context = self._build_context(deps, results)
+                                    
+                                    trace.append({
+                                        "node": node_id,
+                                        "type": node.type,
+                                        "role": node.role,
+                                        "instruction": node.instruction[:300],
+                                        "context": context[:500],
+                                        "output": output,
+                                        "duration_ms": duration_ms,
+                                        "success": node_success,
+                                        "error": error_msg,
+                                        "retry_count": 0,
+                                    })
+                                except Exception as e:
+                                    node_id = futures.get(future, "unknown")
+                                    self._emit("tgr_parallel_error", f"Node {node_id} failed: {str(e)[:100]}")
+                                    if node_id != "unknown" and node_id in self.nodes:
+                                        results[node_id] = f"[error: {str(e)[:100]}]"
+                                        trace.append({
+                                            "node": node_id,
+                                            "type": self.nodes[node_id].type,
+                                            "role": self.nodes[node_id].role,
+                                            "instruction": self.nodes[node_id].instruction[:300],
+                                            "context": "",
+                                            "output": f"[error: {str(e)[:100]}]",
+                                            "duration_ms": 0,
+                                            "success": False,
+                                            "error": str(e)[:200],
+                                            "retry_count": 0,
+                                        })
+                        except concurrent.futures.TimeoutError:
+                            self._emit("tgr_parallel_timeout", f"Level {level_idx + 1} timed out")
+                    
+                    self._emit("tgr_parallel_complete", f"Level {level_idx + 1} completed")
+        else:
+            # Sequential execution (original behavior)
+            for node_id in ordered:
+                if (time.perf_counter() - start) > self.overall_timeout:
+                    self._emit("tgr_timeout", "Overall TGR timeout reached")
+                    trace.append({
+                        "node": node_id, 
+                        "type": "timeout", 
+                        "role": "system", 
+                        "output": "[timeout]",
+                        "error": "Overall timeout reached",
+                        "duration_ms": 0,
+                        "success": False,
+                    })
+                    break
+                node = self.nodes[node_id]
+                deps = [src for src, tgt in self.edges if tgt == node_id]
+                context = self._build_context(deps, results)
+
+                self._emit("tgr_node_start", f"{node_id} ({node.type}/{node.role})")
+                
+                # Track node timing
+                node_start = time.perf_counter()
+                self._node_start_times[node_id] = node_start
+                
+                # Use backtracking execution if enabled for appropriate node types
+                if self.enable_backtracking and self._backtrack_manager.should_verify_node(node.type, node.role):
+                    output, node_success, error_msg, retry_count = self._execute_node_with_backtracking(
+                        node=node,
+                        deps=deps,
+                        results=results,
+                        trace=trace,
+                        start_time=start,
+                    )
+                else:
+                    # Standard execution without backtracking
+                    instruction = f"{node.instruction}\n\nContext:\n{context}"
+                    numeric_expected = bool(re.search(r"####", node.instruction))
+                    error_msg: Optional[str] = None
+                    node_success = True
+                    retry_count = 0
+                    
+                    try:
+                        # Handle different node types
+                        if node.type == "retrieval" or node.role == "rag":
+                            # RAG retrieval node - fetch documents from knowledge base
+                            output = self._run_retrieval(node.instruction, context)
+                        elif node.role == "research" or node.type == "calculation":
+                            output = self._run_research(instruction, context=context)
+                        elif node.type == "aggregation":
+                            output = self._run_logic(instruction, role="logic", context=context, numeric_expected=numeric_expected)
+                        elif node.type == "verification":
+                            candidate = results.get(deps[-1], "") if deps else ""
+                            numeric_guess = _extract_numeric(candidate) or candidate
+                            verified = self.verifier.verify_numeric(self.problem, numeric_guess, context)
+                            output = verified or candidate
+                        else:
+                            output = self._run_logic(instruction, role=node.role, context=context, numeric_expected=numeric_expected)
+
+                        # Check for error indicators in output
+                        if output.startswith("[") and ("error" in output.lower() or "timeout" in output.lower()):
+                            node_success = False
+                            error_msg = output[:200]
+                    except Exception as e:
+                        output = f"[error: {str(e)[:150]}]"
+                        error_msg = str(e)[:200]
+                        node_success = False
+
+                node_duration_ms = (time.perf_counter() - node_start) * 1000
+                results[node_id] = output
+                
+                # Enhanced trace entry with timing and context info
                 trace.append({
                     "node": node_id, 
-                    "type": "timeout", 
-                    "role": "system", 
-                    "output": "[timeout]",
-                    "error": "Overall timeout reached",
-                    "duration_ms": 0,
-                    "success": False,
+                    "type": node.type, 
+                    "role": node.role, 
+                    "instruction": node.instruction[:300],
+                    "context": context[:500],
+                    "output": output,
+                    "duration_ms": node_duration_ms,
+                    "success": node_success,
+                    "error": error_msg,
+                    "retry_count": retry_count,
                 })
-                break
-            node = self.nodes[node_id]
-            deps = [src for src, tgt in self.edges if tgt == node_id]
-            context = self._build_context(deps, results)
-
-            self._emit("tgr_node_start", f"{node_id} ({node.type}/{node.role})")
-            
-            # Track node timing
-            node_start = time.perf_counter()
-            self._node_start_times[node_id] = node_start
-            
-            # Use backtracking execution if enabled for appropriate node types
-            if self.enable_backtracking and self._backtrack_manager.should_verify_node(node.type, node.role):
-                output, node_success, error_msg, retry_count = self._execute_node_with_backtracking(
-                    node=node,
-                    deps=deps,
-                    results=results,
-                    trace=trace,
-                    start_time=start,
-                )
-            else:
-                # Standard execution without backtracking
-                instruction = f"{node.instruction}\n\nContext:\n{context}"
-                numeric_expected = bool(re.search(r"####", node.instruction))
-                error_msg: Optional[str] = None
-                node_success = True
-                retry_count = 0
-                
-                try:
-                    # Handle different node types
-                    if node.type == "retrieval" or node.role == "rag":
-                        # RAG retrieval node - fetch documents from knowledge base
-                        output = self._run_retrieval(node.instruction, context)
-                    elif node.role == "research" or node.type == "calculation":
-                        output = self._run_research(instruction, context=context)
-                    elif node.type == "aggregation":
-                        output = self._run_logic(instruction, role="logic", context=context, numeric_expected=numeric_expected)
-                    elif node.type == "verification":
-                        candidate = results.get(deps[-1], "") if deps else ""
-                        numeric_guess = _extract_numeric(candidate) or candidate
-                        verified = self.verifier.verify_numeric(self.problem, numeric_guess, context)
-                        output = verified or candidate
-                    else:
-                        output = self._run_logic(instruction, role=node.role, context=context, numeric_expected=numeric_expected)
-
-                    # Check for error indicators in output
-                    if output.startswith("[") and ("error" in output.lower() or "timeout" in output.lower()):
-                        node_success = False
-                        error_msg = output[:200]
-                except Exception as e:
-                    output = f"[error: {str(e)[:150]}]"
-                    error_msg = str(e)[:200]
-                    node_success = False
-
-            node_duration_ms = (time.perf_counter() - node_start) * 1000
-            results[node_id] = output
-            
-            # Enhanced trace entry with timing and context info
-            trace.append({
-                "node": node_id, 
-                "type": node.type, 
-                "role": node.role, 
-                "instruction": node.instruction[:300],
-                "context": context[:500],
-                "output": output,
-                "duration_ms": node_duration_ms,
-                "success": node_success,
-                "error": error_msg,
-                "retry_count": retry_count,
-            })
 
         # Pick last available node output as final
         final_answer = ""
