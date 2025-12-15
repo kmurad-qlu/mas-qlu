@@ -390,6 +390,46 @@ class SupervisorAgent:
     def _emit_thinking(self, stage: str, content: str) -> None:
         if self._thinking_callback:
             self._thinking_callback(stage, content)
+    
+    def _gather_latent_context(self, latent_bus: Any, problem: str) -> str:
+        """
+        Gather latent context from the communication bus.
+        Returns a summary string to inject into synthesis.
+        """
+        parts = []
+        
+        try:
+            # Get average confidence
+            avg_conf = latent_bus.get_average_confidence()
+            if avg_conf < 0.6:
+                parts.append(f"[Latent Warning: Low average confidence ({avg_conf:.2f})]")
+                self._emit_thinking("latent_low_confidence", f"Average confidence: {avg_conf:.2f}")
+            
+            # Check for disagreements
+            disagreements = latent_bus.find_disagreements()
+            if disagreements:
+                for d in disagreements[:2]:
+                    parts.append(f"[Latent Warning: {d.agent1} and {d.agent2} disagree (sim={d.similarity:.2f})]")
+                self._emit_thinking("latent_disagreements", f"Found {len(disagreements)} agent disagreements")
+            
+            # Get key entities from merged attention
+            merged_attention = latent_bus.get_merged_attention()
+            if merged_attention:
+                top_entities = merged_attention.top_entities(5)
+                if top_entities:
+                    entities_str = ", ".join(e[0] for e in top_entities)
+                    parts.append(f"[Latent Focus: Key entities: {entities_str}]")
+                    self._emit_thinking("latent_key_entities", f"Key entities: {entities_str}")
+            
+            # Get low-confidence agents
+            low_conf = latent_bus.get_low_confidence_agents(0.5)
+            if low_conf:
+                agents_str = ", ".join(f"{a}({c:.2f})" for a, c in low_conf[:3])
+                parts.append(f"[Latent Warning: Uncertain agents: {agents_str}]")
+        except Exception as e:
+            self._emit_thinking("latent_error", f"Error gathering latent context: {str(e)[:100]}")
+        
+        return "\n".join(parts)
 
     def decompose(self, problem: str) -> Plan:
         self._emit_thinking("decompose_start", f"Analyzing problem: {problem[:200]}...")
@@ -450,8 +490,17 @@ class SupervisorAgent:
         web_evidence: Optional[str] = None,
         rag_evidence: Optional[str] = None,
         rag_citations: Optional[str] = None,
+        latent_bus: Optional[Any] = None,
     ) -> str:
         self._emit_thinking("synthesize_start", f"Synthesizing from {len(results)} worker results...")
+        
+        # Latent communication: gather insights from hidden states
+        latent_context = ""
+        if latent_bus is not None:
+            try:
+                latent_context = self._gather_latent_context(latent_bus, problem)
+            except Exception as e:
+                self._emit_thinking("latent_error", f"Latent context gathering failed: {str(e)[:100]}")
         
         # Detect question type and use appropriate synthesis prompt
         question_type = _detect_question_type(problem)
@@ -525,12 +574,17 @@ class SupervisorAgent:
                 "Citations (use [R#] for RAG chunks and [W#] for web/fetched pages if provided):\n"
                 f"{rag_citations.strip()}\n\n"
             )
+        
+        # Latent context (inter-agent hidden state insights)
+        latent_section = ""
+        if latent_context and latent_context.strip():
+            latent_section = f"Latent Insights (agent confidence and focus):\n{latent_context.strip()}\n\n"
 
         messages = [
             {"role": "system", "content": system_content},
             {
                 "role": "user",
-                "content": f"Problem:\n{problem}\n\n{web_section}Worker outputs:\n{context}\n\nFinal answer:",
+                "content": f"Problem:\n{problem}\n\n{web_section}{latent_section}Worker outputs:\n{context}\n\nFinal answer:",
             },
         ]
         # Add RAG only for formats where we can actually cite (avoid breaking strict numeric/boolean outputs).
@@ -540,6 +594,7 @@ class SupervisorAgent:
                 f"{web_section}"
                 f"{rag_section}"
                 f"{rag_citations_section}"
+                f"{latent_section}"
                 f"Worker outputs:\n{context}\n\n"
                 "Final answer (cite sources using [R#] and/or [W#] where relevant; do not invent citations):"
             )
