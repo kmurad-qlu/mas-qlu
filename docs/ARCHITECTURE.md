@@ -1611,7 +1611,7 @@ def _detect_question_type(problem: str) -> str:
     Returns:
     - 'numeric': single number (How many, Compute, Calculate)
     - 'boolean': yes/no (Is, Are, Does, Can, Will)
-    - 'multi_quantity': JSON list (List, What are the, Name the)
+    - 'multi_quantity': compound questions or lists (What was X, and how many Y?)
     - 'explanatory': narrative prose (Explain, Describe, Discuss)
     - 'factual': concise answer (default)
     """
@@ -1627,7 +1627,20 @@ def _detect_question_type(problem: str) -> str:
     if any(cue in p for cue in explanatory_cues):
         return "explanatory"
     
-    # Numeric cues
+    # COMPOUND QUESTIONS - Check BEFORE single numeric
+    # Catches: "What was X, and how many Y?", "How many X and what was Y?"
+    compound_patterns = [
+        r"\band\s+how\s+many\b",      # "and how many" anywhere
+        r"\band\s+what\s+(is|was|are|were)\b",  # "and what is/was"
+        r",\s*and\s+how\s+many",      # ", and how many"
+        r",\s*and\s+what\s+",         # ", and what"
+        r"\bwhat\s+was\b.*\band\b.*\bhow\s+many\b",  # cross-pattern
+    ]
+    for pat in compound_patterns:
+        if re.search(pat, p):
+            return "multi_quantity"
+    
+    # Numeric cues (only if NOT a compound question)
     numeric_cues = ["how many", "compute", "calculate", "what is the value"]
     if any(k in p for k in numeric_cues):
         return "numeric"
@@ -1637,12 +1650,32 @@ def _detect_question_type(problem: str) -> str:
     if p.startswith(boolean_starts):
         return "boolean"
     
-    # Multi-quantity cues
+    # Multi-quantity cues (lists)
     if any(k in p for k in ["list ", "what are the", "name the"]):
         return "multi_quantity"
     
     return "factual"
 ```
+
+### Compound Question Detection
+
+Questions like *"What was the total number of X, and how many Y did Z achieve?"* ask for **two distinct pieces of information** but end with a single `?`. These are detected as `multi_quantity` and synthesized as readable text:
+
+```python
+# Pattern matching for compound questions
+compound_patterns = [
+    r"\band\s+how\s+many\b",           # "and how many" anywhere
+    r"\band\s+what\s+(is|was|are|were)\b",  # "and what is/was"
+    r",\s*and\s+(how|what|who|when|where)",  # ", and [question word]"
+]
+
+# Also used in _is_multi_query() to prevent numeric verifier corruption
+```
+
+**Why this matters**: Without compound detection, "What was X, and how many Y?" would:
+1. Trigger `numeric` type (due to "how many")
+2. Pass through the numeric verifier
+3. Potentially corrupt the answer from "242,3" to "242,2"
 
 ### Format-Aware Synthesis
 
@@ -1708,6 +1741,17 @@ The Storming of the Bastille on July 14, 1789 symbolized...
 #### Lasting Impact
 The revolution's ideals of liberty, equality, and fraternity shaped...
 ```
+
+**Multi-Quantity Question** (compound):
+```
+Q: What was the total number of hand-built Jaguar XK120 cars, and how many 
+   IndyCar races did Truesports win in 1987?
+A: The total number of hand-built, aluminum-bodied Jaguar XK120 cars produced 
+   was 242, and the Truesports team won 3 IndyCar races during their final 
+   CART championship season in 1987.
+```
+
+Note: Multi-quantity answers are now formatted as readable text, not JSON.
 
 ---
 
@@ -1986,6 +2030,13 @@ plan_graph.py
 - **Minimum Template Score**: Threshold (score ≥ 5) to avoid false-positive template selection
 - **Seed Chunk Reuse**: Uses original problem for RAG queries to avoid malformed subtask instructions
 
+#### Question Type & Synthesis Improvements
+- **Compound Question Detection**: Detects "What was X, and how many Y?" patterns as `multi_quantity`
+- **Multi-Query Guard**: Prevents numeric verifier from corrupting compound answers
+- **Text-Based Multi-Quantity Output**: Multi-value answers now formatted as readable sentences, not JSON
+- **Enhanced Factual Detection**: Sports terms (NFL, draft, touchdown, career) and strong patterns for template routing
+- **Pattern-Based Strong Signals**: "what are the key details", "first career touchdown", "selection in the [year]"
+
 ---
 
-*Last updated: December 14, 2025 — TGR Pipeline Enhancements (Dynamic Templates, Backtracking, Distillation Loop)*
+*Last updated: December 14, 2025 — Compound Question Detection, Enhanced Factual Routing*

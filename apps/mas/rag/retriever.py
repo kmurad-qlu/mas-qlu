@@ -81,7 +81,7 @@ class HybridRetriever:
         self.semantic_weight = semantic_weight
         self.lexical_weight = lexical_weight
         self._emit = thinking_callback or (lambda s, c: None)
-
+        
         # Simple per-instance caches/limits (avoid repeated embedding + improve diversity).
         self._query_embed_cache: Dict[str, np.ndarray] = {}
         self._query_embed_cache_max = 128
@@ -420,7 +420,7 @@ class HybridRetriever:
 
         # Emit UI-friendly chunk summaries
         self._emit_chunk_summary(query=query, chunks=chunks)
-
+        
         self._emit("retrieval_complete", f"Returned {len(chunks)} chunks via RRF fusion")
         
         return chunks

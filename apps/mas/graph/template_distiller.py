@@ -162,6 +162,11 @@ class RAGTemplateDistiller(TemplateDistiller):
         "movie", "film", "actor", "actress", "singer", "album", "song",
         "book", "author", "wrote", "published", "founded", "invented",
         "born", "died", "married", "elected", "appointed", "awarded",
+        # Sports-related terms
+        "nfl", "nba", "mlb", "nhl", "draft", "drafted", "selection", "selected",
+        "touchdown", "goal", "score", "scored", "career", "season", "game",
+        "championship", "super bowl", "world series", "finals", "playoff",
+        "coach", "manager", "roster", "debut", "first career",
         "capital", "population", "located", "headquarters",
     ]
     
@@ -186,7 +191,31 @@ class RAGTemplateDistiller(TemplateDistiller):
         Detect if the question is a factual/QA question that should NOT
         be routed through math templates.
         """
+        import re as _re
         p = problem.lower()
+        
+        # Strong factual patterns (immediately return True)
+        strong_patterns = [
+            r"what (are|is|was|were) the (key )?(details|facts|information)",
+            r"(tell me|describe|explain) (about|the)",
+            r"(first|second|third) career",
+            r"(first|last) (career )?(touchdown|goal|score|point)",
+            r"(selection|pick|draft|drafted) in the \d{4}",
+            r"(nfl|nba|mlb|nhl|pga|pba) (draft|season|career)",
+            r"who (is|was|are|were) \w+",
+            r"where (is|was|did|does)",
+            r"when (was|did|is|does)",
+        ]
+        for pat in strong_patterns:
+            if _re.search(pat, p):
+                return True
+        
+        # Strong factual signals (named entities, events)
+        strong_factual = ["airlines", "flight", "mh17", "malaysia", "missile", "buk",
+                         "president", "prime minister", "war", "conflict", "crash",
+                         "nfl draft", "nba draft", "first career", "career touchdown"]
+        if any(s in p for s in strong_factual):
+            return True
         
         # Count factual and math signals
         factual_count = sum(1 for s in RAGTemplateDistiller.FACTUAL_SIGNALS if s in p)
@@ -196,11 +225,11 @@ class RAGTemplateDistiller(TemplateDistiller):
         if factual_count > math_count and factual_count >= 2:
             return True
         
-        # Strong factual signals (named entities, events)
-        strong_factual = ["airlines", "flight", "mh17", "malaysia", "missile", "buk",
-                         "president", "prime minister", "war", "conflict", "crash"]
-        if any(s in p for s in strong_factual):
-            return True
+        # If at least one strong factual keyword and no math signals, treat as factual
+        if factual_count >= 1 and math_count == 0:
+            # Check for any explicit person/entity name pattern
+            if _re.search(r"[A-Z][a-z]+(?:'s)?", problem):  # Capitalized name
+                return True
         
         return False
     

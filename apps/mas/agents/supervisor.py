@@ -161,6 +161,7 @@ def _detect_question_type(problem: str) -> str:
     - 'explanatory': narrative prose (e.g., "Explain...", "Describe...", "Discuss...")
     - 'factual': concise factual answer (e.g., "Who wrote...", "When did...")
     """
+    import re as _re
     p = problem.strip().lower()
     
     # Explanatory questions - want narrative prose (check first, higher priority)
@@ -176,7 +177,27 @@ def _detect_question_type(problem: str) -> str:
     if any(cue in p for cue in explanatory_cues):
         return "explanatory"
     
-    # Numeric questions - want single number
+    # COMPOUND QUESTIONS - Check for multiple values BEFORE checking for single numeric
+    # These are questions asking for two or more distinct pieces of information
+    # E.g., "What was X, and how many Y?" or "How many X and what was Y?"
+    compound_patterns = [
+        r",\s*and\s+how\s+many",      # ", and how many"
+        r",\s*and\s+what\s+",         # ", and what"
+        r",\s*and\s+who\s+",          # ", and who"
+        r",\s*and\s+when\s+",         # ", and when"
+        r",\s*and\s+where\s+",        # ", and where"
+        r"\?\s*and\s+",               # "? and" (two questions)
+        r"\band\s+how\s+many\b",      # "and how many" anywhere
+        r"\band\s+what\s+(is|was|are|were)\b",  # "and what is/was/are/were"
+        r"\bhow\s+many\b.*\band\b.*\bhow\s+many\b",  # "how many...and...how many"
+        r"\bwhat\s+was\b.*\band\b.*\bhow\s+many\b",  # "what was...and...how many"
+        r"\btotal\s+number\b.*\band\b.*\bhow\s+many\b",  # "total number...and...how many"
+    ]
+    for pat in compound_patterns:
+        if _re.search(pat, p):
+            return "multi_quantity"
+    
+    # Numeric questions - want single number (only if NOT a compound question)
     numeric_cues = [
         "how many", "compute", "calculate", "what is the value",
         "find the number", "count the", "total number", "sum of",
@@ -473,9 +494,11 @@ class SupervisorAgent:
             system_content = (
                 "You are the Supervisor synthesizing a final answer from worker outputs.\n"
                 "OUTPUT POLICY FOR MULTI-VALUE QUESTIONS:\n"
-                "- Return a COMPACT JSON object with snake_case keys.\n"
-                "- Include only the requested values.\n"
-                "- No prose or explanations."
+                "- The question asks for MULTIPLE distinct pieces of information.\n"
+                "- Provide ALL requested values in a clear, readable sentence.\n"
+                "- Format: 'The [first thing] was [value1], and [second thing] was [value2].'\n"
+                "- Be accurate and cite the exact values from the worker outputs.\n"
+                "- Do NOT use JSON format. Write a complete, human-readable answer."
             )
         else:  # factual
             system_content = (
@@ -610,9 +633,11 @@ class SupervisorAgent:
                 "You are the Supervisor making a corrected FINAL answer.\n"
                 "Incorporate the critique to fix any missing or incorrect values.\n"
                 "STRICT OUTPUT POLICY:\n"
-                "- Output a compact JSON object with snake_case keys.\n"
-                "- Include only the requested values.\n"
-                "- No prose or explanations."
+                "- The question asks for MULTIPLE distinct pieces of information.\n"
+                "- Provide ALL requested values in a clear, readable sentence.\n"
+                "- Format: 'The [first thing] was [value1], and [second thing] was [value2].'\n"
+                "- Be accurate and cite the exact values from the worker outputs.\n"
+                "- Do NOT use JSON format. Write a complete, human-readable answer."
             )
         else:  # factual
             system_content = (
