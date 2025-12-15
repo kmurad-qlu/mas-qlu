@@ -207,6 +207,23 @@ def _looks_single_number_question(problem: str, plan: Plan | None) -> bool:
         # Common multi-step discourse markers
         if any(k in t for k in ["and then", "then she", "then he", "also", "as well", "after that"]):
             return True
+        # Compound questions joined by "and" asking for multiple pieces of information
+        # E.g., "What was X, and how many Y?" or "How many X and what was Y?"
+        compound_patterns = [
+            r",\s*and\s+how\s+many",      # ", and how many"
+            r",\s*and\s+what\s+",         # ", and what"
+            r",\s*and\s+who\s+",          # ", and who"
+            r",\s*and\s+when\s+",         # ", and when"
+            r",\s*and\s+where\s+",        # ", and where"
+            r"\?\s*and\s+",               # "? and" (two questions)
+            r"\band\s+how\s+many\b",      # "and how many" anywhere
+            r"\band\s+what\s+(is|was|are|were)\b",  # "and what is/was/are/were"
+            r"\bhow\s+many\b.*\band\b.*\bhow\s+many\b",  # "how many...and...how many"
+            r"\bwhat\s+was\b.*\band\b.*\bhow\s+many\b",  # "what was...and...how many"
+        ]
+        for pat in compound_patterns:
+            if re.search(pat, t):
+                return True
         return False
 
     if _is_multi_query(problem):
@@ -267,12 +284,31 @@ def _extract_numeric(text: str) -> str | None:
 def _is_multi_query(problem: str) -> bool:
     """
     Detect whether the prompt likely requests multiple answers.
+    Catches both explicit multiple question marks and compound questions
+    joined by "and" that ask for multiple pieces of information.
     """
     t = problem.strip().lower()
     if t.count("?") > 1:
         return True
     if any(k in t for k in ["and then", "then she", "then he", "also", "as well", "after that"]):
         return True
+    # Compound questions joined by "and" asking for multiple pieces of information
+    # E.g., "What was X, and how many Y?" or "How many X and what was Y?"
+    compound_patterns = [
+        r",\s*and\s+how\s+many",      # ", and how many"
+        r",\s*and\s+what\s+",         # ", and what"
+        r",\s*and\s+who\s+",          # ", and who"
+        r",\s*and\s+when\s+",         # ", and when"
+        r",\s*and\s+where\s+",        # ", and where"
+        r"\?\s*and\s+",               # "? and" (two questions)
+        r"\band\s+how\s+many\b",      # "and how many" anywhere
+        r"\band\s+what\s+(is|was|are|were)\b",  # "and what is/was/are/were"
+        r"\bhow\s+many\b.*\band\b.*\bhow\s+many\b",  # "how many...and...how many"
+        r"\bwhat\s+was\b.*\band\b.*\bhow\s+many\b",  # "what was...and...how many"
+    ]
+    for pat in compound_patterns:
+        if re.search(pat, t):
+            return True
     return False
 
 
@@ -710,7 +746,7 @@ def solve_with_budget(
                 _emit_thinking("rag_skip", f"RAG database not found at {rag_db_path}, skipping RAG")
         except Exception as e:
             _emit_thinking("rag_init_error", f"Failed to initialize RAG: {str(e)[:150]}")
-
+    
     # Wire up thinking callbacks
     supervisor.set_thinking_callback(_emit_thinking)
     swarm.set_thinking_callback(_emit_thinking)

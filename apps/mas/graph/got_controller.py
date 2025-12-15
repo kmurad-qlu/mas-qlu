@@ -566,7 +566,7 @@ class GoTController:
                         output = verified or candidate
                     else:
                         output = self._run_logic(instruction, role=node.role, context=context, numeric_expected=numeric_expected)
-                    
+
                     # Check for error indicators in output
                     if output.startswith("[") and ("error" in output.lower() or "timeout" in output.lower()):
                         node_success = False
